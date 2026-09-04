@@ -9,12 +9,12 @@ import itertools
 import pickle
 import uuid
 
-from prompt_dt.prompt_decision_transformer import Predictor
-from prompt_dt.prompt_seq_trainer import PromptSequenceTrainer
-from prompt_dt.prompt_utils import get_env_list, set_seed, group_task_indices_by_type
-from prompt_dt.prompt_utils import get_prompt_batch, get_prompt, get_batch, get_batch_finetune, flatten_prompt
-from prompt_dt.prompt_utils import process_total_data_mean, load_data_prompt, process_info, text_encoding
-from prompt_dt.prompt_utils import eval_episodes, eval_episodes_llm
+from tenet.prompt_decision_transformer import Predictor
+from tenet.prompt_seq_trainer import PromptSequenceTrainer
+from tenet.prompt_utils import get_env_list, set_seed, group_task_indices_by_type
+from tenet.prompt_utils import get_prompt_batch, get_prompt, get_batch, get_batch_finetune, flatten_prompt
+from tenet.prompt_utils import process_total_data_mean, load_data_prompt, process_info, text_encoding
+from tenet.prompt_utils import eval_episodes, eval_episodes_llm
 
 from collections import namedtuple
 import json, pickle, os
