@@ -1,13 +1,22 @@
+"""Generate expert and prompt trajectories for the supported benchmarks."""
+
 import argparse
+import json
 import os
 import pickle
-import json
+
 import numpy as np
+
 import metaworld
 from metaworld.policies import ENV_POLICY_MAP
 
-# ======================= Config =======================
+
 SEED = 1
+TAIL_STEPS_AFTER_SUCCESS = 2
+PROMPT_LAST_STEPS = 5
+TRAIN_COUNT_ML1 = 45
+GOAL_DIM = 3
+
 SUPPORTED_BENCHMARKS = (
     "ml1-v3-pick-place-v3",
     "mt10-v3",
@@ -15,307 +24,394 @@ SUPPORTED_BENCHMARKS = (
     "mt50-ml45split-v3",
 )
 
-parser = argparse.ArgumentParser(description="Generate Meta-World expert datasets.")
-parser.add_argument(
-    "--bench",
-    choices=SUPPORTED_BENCHMARKS,
-    default="mt50-ml45split-v3",
-    help="Benchmark to generate (default: mt50-ml45split-v3).",
-)
-BENCH = parser.parse_args().bench
 
-TAIL_STEPS_AFTER_SUCCESS = 2
-PROMPT_LAST_STEPS = 5
-TRAIN_COUNT_ML1 = 45   # 45 train / 5 test for ML1 (90/10 for success-filtered)
-GOAL_DIM = 3           # the last 3 elements are the goal slot
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--bench",
+        choices=SUPPORTED_BENCHMARKS,
+        default="mt50-ml45split-v3",
+        help="Benchmark to generate (default: mt50-ml45split-v3).",
+    )
+    return parser
 
-# Dirs
-config_dir = f"config/{BENCH}"
-data_dir   = f"data/{BENCH}"
-os.makedirs(config_dir, exist_ok=True)
-os.makedirs(data_dir, exist_ok=True)
 
-# =================== Helpers ==========================
-def get_benchmark(bench_name: str):
-    """
-    Returns (benchmark_obj, bench_tag).
-    - mt10-v3                  -> (MT10(seed), "mt10-v3")
-    - mt50-v3                  -> (MT50(seed), "mt50-v3")
-    - mt50-ml45split-v3        -> (MT50(seed), "mt50-ml45split-v3")
-    - ml1-v3-<env_name>        -> (ML1(seed, env_name=<env_name>), "ml1-v3-<env_name>")
-    """
+def get_benchmark(bench_name, seed=SEED):
+    """Construct the requested Meta-World benchmark and its output tag."""
     bench_name = bench_name.lower().strip()
 
     if bench_name.startswith("mt50-ml45split"):
-        return metaworld.MT50(seed=SEED), "mt50-ml45split-v3"
-
+        return metaworld.MT50(seed=seed), "mt50-ml45split-v3"
     if bench_name.startswith("mt50"):
-        return metaworld.MT50(seed=SEED), "mt50-v3"
-
+        return metaworld.MT50(seed=seed), "mt50-v3"
     if bench_name.startswith("mt10"):
-        return metaworld.MT10(seed=SEED), "mt10-v3"
-
+        return metaworld.MT10(seed=seed), "mt10-v3"
     if bench_name.startswith("ml1"):
         parts = bench_name.split("-")
         if len(parts) < 4:
-            raise ValueError(f"ML1 tag must be like 'ml1-v3-pick-place-v3', got '{bench_name}'")
-        env_name = "-".join(parts[2:])  # e.g., 'pick-place-v3'
-        return metaworld.ML1(seed=SEED, env_name=env_name), bench_name
+            raise ValueError(
+                "ML1 tag must be like 'ml1-v3-pick-place-v3', "
+                f"got '{bench_name}'"
+            )
+        env_name = "-".join(parts[2:])
+        return metaworld.ML1(seed=seed, env_name=env_name), bench_name
 
     raise ValueError(f"Unknown benchmark: {bench_name}")
 
-def get_expert_policy_class(env_name: str):
+
+def get_expert_policy_class(env_name):
+    """Return the scripted Meta-World expert policy for an environment."""
     if env_name not in ENV_POLICY_MAP:
         raise ValueError(f"No expert policy found for env: {env_name}")
     return ENV_POLICY_MAP[env_name]
 
-def safe_mean(xs):
-    return float(np.mean(xs)) if len(xs) else 0.0
-def safe_min(xs):
-    return int(np.min(xs)) if len(xs) else 0
-def safe_max(xs):
-    return int(np.max(xs)) if len(xs) else 0
 
-def get_goal_vec_from_env(env) -> np.ndarray:
-    """
-    Get the 3D goal associated with the current task WITHOUT modifying Meta-World.
-    Priority:
-      1) env._last_rand_vec[-3:]  (task's goal from rand_vec)
-      2) env._target_pos          (goal set at reset_model)
-    """
+def safe_mean(values):
+    return float(np.mean(values)) if values else 0.0
+
+
+def safe_min(values):
+    return int(np.min(values)) if values else 0
+
+
+def safe_max(values):
+    return int(np.max(values)) if values else 0
+
+
+def get_goal_vec_from_env(env):
+    """Read the current task's 3D goal without modifying Meta-World."""
     if hasattr(env, "_last_rand_vec") and env._last_rand_vec is not None:
-        vec = np.asarray(env._last_rand_vec).reshape(-1)
-        if vec.size >= GOAL_DIM:
-            return vec[-GOAL_DIM:].astype(np.float32).copy()
+        vector = np.asarray(env._last_rand_vec).reshape(-1)
+        if vector.size >= GOAL_DIM:
+            return vector[-GOAL_DIM:].astype(np.float32).copy()
     if hasattr(env, "_target_pos") and env._target_pos is not None:
-        tgt = np.asarray(env._target_pos).reshape(-1)
-        if tgt.size >= GOAL_DIM:
-            return tgt[:GOAL_DIM].astype(np.float32).copy()
-    raise RuntimeError("Could not determine goal vector from env (_last_rand_vec or _target_pos).")
+        target = np.asarray(env._target_pos).reshape(-1)
+        if target.size >= GOAL_DIM:
+            return target[:GOAL_DIM].astype(np.float32).copy()
+    raise RuntimeError(
+        "Could not determine goal vector from env "
+        "(_last_rand_vec or _target_pos)."
+    )
 
-rng = np.random.RandomState(SEED)
 
-# =================== Init benchmark ====================
-bench, bench_tag = get_benchmark(BENCH)
-train_classes = bench.train_classes
-train_tasks   = bench.train_tasks
-env_names     = list(train_classes.keys())  # e.g., ['pick-place-v3'] for ML1
+def group_task_indices_by_environment(env_names, tasks):
+    """Map each environment name to its task indices in benchmark order."""
+    grouped = {name: [] for name in env_names}
+    for task_id, task in enumerate(tasks):
+        grouped[task.env_name].append(task_id)
+    return grouped
 
-# If using mt50-ml45split-v3, derive env-name split from ML45
-ml45_train_envs, ml45_test_envs = set(), set()
-if bench_tag == "mt50-ml45split-v3":
-    ml45 = metaworld.ML45(seed=SEED)   # only to read the split
-    ml45_train_envs = set(ml45.train_classes.keys())
-    ml45_test_envs  = set(ml45.test_classes.keys())
 
-    overlap = ml45_train_envs & ml45_test_envs
+def get_ml45_environment_split(env_names, seed):
+    """Return the ML45 environment-name split used by the extra MT50 variant."""
+    ml45 = metaworld.ML45(seed=seed)
+    train_envs = set(ml45.train_classes.keys())
+    test_envs = set(ml45.test_classes.keys())
+
+    overlap = train_envs & test_envs
     if overlap:
         raise RuntimeError(f"ML45 train/test sets overlap: {sorted(overlap)}")
 
-    missing = set(env_names) - (ml45_train_envs | ml45_test_envs)
+    missing = set(env_names) - (train_envs | test_envs)
     if missing:
-        # Not fatal. Commonly MT50 contains all ML45 envs (plus extra), or naming differences across versions.
-        print(f"[WARN] MT50 envs not covered by ML45 split: {sorted(missing)} (will default to train)")
+        print(
+            f"[WARN] MT50 envs not covered by ML45 split: {sorted(missing)} "
+            "(will default to train)"
+        )
+    return train_envs, test_envs
 
-# Map: env_name -> list of task indices
-env_to_task_indices_raw = {name: [] for name in env_names}
-for idx, task in enumerate(train_tasks):
-    env_to_task_indices_raw[task.env_name].append(idx)
 
-# =================== Outputs/Trackers ==================
-successful_task_ids = []
-task_id_to_env = {}   # task_id -> env_name (MT) or short tXXX (ML1)
-env_to_task_ids = {}  # env_name -> [task_ids]
+def initialize_trajectory():
+    """Create the trajectory structure expected by the training data loader."""
+    return {
+        "observations": [],
+        "next_observations": [],
+        "actions": [],
+        "rewards": [],
+        "terminates": [],
+        "truncates": [],
+        "dones": [],
+        "success": [],
+    }
 
-# Stats (successful episodes only)
-env_stats = {name: {"returns": [], "steps": [], "count": 0} for name in env_names}
-overall_returns, overall_steps = [], []
 
-is_ml1 = bench_tag.startswith("ml1-v3")
+def collect_expert_trajectory(env_cls, task, expert, is_ml1):
+    """Run one scripted expert episode and return it only when successful."""
+    env = env_cls()
+    env.set_task(task)
+    reset_output = env.reset()
+    if isinstance(reset_output, tuple) and len(reset_output) == 2:
+        observation = reset_output[0]
+    else:
+        observation = reset_output
+    observation = np.asarray(observation, dtype=np.float32)
 
-# To be filled later
-train_tasks_list, test_tasks_list = [], []
+    # ML1 hides its goal in the stored observation. The scripted expert needs
+    # the true goal, while training must retain the original observation.
+    if is_ml1:
+        goal_vector = get_goal_vec_from_env(env)
+        observation_for_policy = observation.copy()
+        observation_for_policy[-GOAL_DIM:] = goal_vector
+        observation_to_store = observation.copy()
+    else:
+        goal_vector = None
+        observation_for_policy = observation
+        observation_to_store = observation
 
-# =================== Main Loop =========================
-for env_name in env_names:
-    print(f"\n=== {env_name.upper()} ===")
-    env_cls = train_classes[env_name]
-    expert  = get_expert_policy_class(env_name)()
+    trajectory = initialize_trajectory()
+    success_seen = False
+    post_success_steps = 0
+    steps = 0
+    episode_return = 0.0
 
-    for task_id in env_to_task_indices_raw[env_name]:
-        env = env_cls()
-        env.set_task(train_tasks[task_id])        # fixes the task (contains rand_vec)
-        reset_out = env.reset()
-        obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) == 2) else reset_out
-        obs = np.asarray(obs, dtype=np.float32)
+    while True:
+        action = expert.get_action(observation_for_policy)
+        next_observation, reward, terminate, truncate, info = env.step(action)
+        next_observation = np.asarray(next_observation, dtype=np.float32)
+        done = bool(terminate or truncate)
 
-        # Two obs variants:
-        # - obs_for_policy: overwrite last 3 slots with true goal (so expert policy works)
-        # - obs_to_store: keep as-is (last 3 zeros in ML1)
         if is_ml1:
-            goal_vec = get_goal_vec_from_env(env)
-            obs_for_policy = obs.copy()
-            obs_for_policy[-GOAL_DIM:] = goal_vec
-            obs_to_store   = obs.copy()
+            next_observation_for_policy = next_observation.copy()
+            next_observation_for_policy[-GOAL_DIM:] = goal_vector
+            next_observation_to_store = next_observation.copy()
         else:
-            obs_for_policy = obs
-            obs_to_store   = obs
+            next_observation_for_policy = next_observation
+            next_observation_to_store = next_observation
 
-        success_seen = False
-        post_success_steps = 0
-        steps = 0
-        ep_return = 0.0
+        trajectory["observations"].append(observation_to_store)
+        trajectory["next_observations"].append(next_observation_to_store)
+        trajectory["actions"].append(np.asarray(action, dtype=np.float32))
+        trajectory["rewards"].append(float(reward))
+        trajectory["terminates"].append(bool(terminate))
+        trajectory["truncates"].append(bool(truncate))
+        trajectory["dones"].append(done)
+        success = float(info.get("success", 0.0))
+        trajectory["success"].append(success)
 
-        traj = {
-            "observations": [],
-            "next_observations": [],
-            "actions": [],
-            "rewards": [],
-            "terminates": [],
-            "truncates": [],
-            "dones": [],
-            "success": []
-        }
+        episode_return += float(reward)
+        steps += 1
 
-        while True:
-            action = expert.get_action(obs_for_policy)
-            next_obs, reward, terminate, truncate, info = env.step(action)
-            next_obs = np.asarray(next_obs, dtype=np.float32)
-            done = bool(terminate or truncate)
+        if not success_seen and success > 0.0:
+            success_seen = True
+            post_success_steps = 0
+        elif success_seen:
+            post_success_steps += 1
 
-            if is_ml1:
-                next_obs_for_policy = next_obs.copy()
-                next_obs_for_policy[-GOAL_DIM:] = goal_vec
-                next_obs_to_store   = next_obs.copy()
-            else:
-                next_obs_for_policy = next_obs
-                next_obs_to_store   = next_obs
+        observation_for_policy = next_observation_for_policy
+        observation_to_store = next_observation_to_store
 
-            traj["observations"].append(obs_to_store)
-            traj["next_observations"].append(next_obs_to_store)
-            traj["actions"].append(np.asarray(action, dtype=np.float32))
-            traj["rewards"].append(float(reward))
-            traj["terminates"].append(bool(terminate))
-            traj["truncates"].append(bool(truncate))
-            traj["dones"].append(done)
-            s = float(info.get("success", 0.0))
-            traj["success"].append(s)
+        if done or (
+            success_seen and post_success_steps >= TAIL_STEPS_AFTER_SUCCESS
+        ):
+            break
 
-            ep_return += float(reward)
-            steps += 1
+    if not success_seen:
+        return None
 
-            if (not success_seen) and (s > 0.0):
-                success_seen = True
-                post_success_steps = 0
-            elif success_seen:
-                post_success_steps += 1
+    trajectory = {key: np.array(values) for key, values in trajectory.items()}
+    return trajectory, episode_return, steps
 
-            obs = next_obs
-            obs_for_policy = next_obs_for_policy
-            obs_to_store   = next_obs_to_store
 
-            if done or (success_seen and post_success_steps >= TAIL_STEPS_AFTER_SUCCESS):
-                break
+def save_trajectory_pair(trajectory, data_dir, base_name):
+    """Save a full expert trajectory and its shortened prompt trajectory."""
+    expert_path = os.path.join(data_dir, f"{base_name}-expert.pkl")
+    with open(expert_path, "wb") as expert_file:
+        pickle.dump([trajectory], expert_file)
 
-        if success_seen:
-            # MT/ML1 naming
-            if is_ml1:
-                fabricated_env_type_short = f"t{task_id:03d}"  # e.g., "t017"
-                env_type_for_maps   = fabricated_env_type_short
-                env_type_for_files  = fabricated_env_type_short
-            else:
-                env_type_for_maps   = env_name
-                env_type_for_files  = env_name
+    if PROMPT_LAST_STEPS > 0:
+        prompt_length = PROMPT_LAST_STEPS
+    else:
+        prompt_length = len(trajectory["observations"])
+    prompt_trajectory = {
+        key: values[-prompt_length:] for key, values in trajectory.items()
+    }
+    prompt_path = os.path.join(data_dir, f"{base_name}-prompt-expert.pkl")
+    with open(prompt_path, "wb") as prompt_file:
+        pickle.dump([prompt_trajectory], prompt_file)
 
+
+def collect_successful_trajectories(benchmark, bench_tag, data_dir):
+    """Collect and save successful scripted-expert trajectories."""
+    train_classes = benchmark.train_classes
+    train_tasks = benchmark.train_tasks
+    env_names = list(train_classes.keys())
+    tasks_by_env = group_task_indices_by_environment(env_names, train_tasks)
+    is_ml1 = bench_tag.startswith("ml1-v3")
+
+    successful_task_ids = []
+    task_id_to_env = {}
+    env_to_task_ids = {}
+    env_stats = {
+        name: {"returns": [], "steps": [], "count": 0} for name in env_names
+    }
+    overall_returns = []
+    overall_steps = []
+
+    for env_name in env_names:
+        print(f"\n=== {env_name.upper()} ===")
+        env_cls = train_classes[env_name]
+        expert = get_expert_policy_class(env_name)()
+
+        for task_id in tasks_by_env[env_name]:
+            result = collect_expert_trajectory(
+                env_cls, train_tasks[task_id], expert, is_ml1
+            )
+            if result is None:
+                continue
+
+            trajectory, episode_return, steps = result
+            env_type = f"t{task_id:03d}" if is_ml1 else env_name
             successful_task_ids.append(task_id)
-            task_id_to_env[task_id] = env_type_for_maps
-            env_to_task_ids.setdefault(env_type_for_maps, []).append(task_id)
+            task_id_to_env[task_id] = env_type
+            env_to_task_ids.setdefault(env_type, []).append(task_id)
 
-            # Save trajectories
-            traj_np = {k: np.array(v) for k, v in traj.items()}
-            base_name = f"{bench_tag}-{env_type_for_files}-{task_id}"
+            base_name = f"{bench_tag}-{env_type}-{task_id}"
+            save_trajectory_pair(trajectory, data_dir, base_name)
 
-            expert_path = os.path.join(data_dir, f"{base_name}-expert.pkl")
-            with open(expert_path, "wb") as f:
-                pickle.dump([traj_np], f)
-
-            last_k = PROMPT_LAST_STEPS if PROMPT_LAST_STEPS > 0 else len(traj_np["observations"])
-            traj_short = {k: v[-last_k:] for k, v in traj_np.items()}
-            prompt_path = os.path.join(data_dir, f"{base_name}-prompt-expert.pkl")
-            with open(prompt_path, "wb") as f:
-                pickle.dump([traj_short], f)
-
-            # Stats
-            env_stats[env_name]["returns"].append(ep_return)
+            env_stats[env_name]["returns"].append(episode_return)
             env_stats[env_name]["steps"].append(steps)
             env_stats[env_name]["count"] += 1
-            overall_returns.append(ep_return)
+            overall_returns.append(episode_return)
             overall_steps.append(steps)
 
-# =================== Train/Test Split ==================
-if is_ml1:
-    # Random split for ML1 (preserve your original behavior)
-    all_ids = np.array(successful_task_ids, dtype=int)
-    rng.shuffle(all_ids)
-    train_tasks_list = all_ids[:TRAIN_COUNT_ML1].tolist()
-    test_tasks_list  = all_ids[TRAIN_COUNT_ML1:].tolist()
+    return {
+        "env_names": env_names,
+        "successful_task_ids": successful_task_ids,
+        "task_id_to_env": task_id_to_env,
+        "env_to_task_ids": env_to_task_ids,
+        "env_stats": env_stats,
+        "overall_returns": overall_returns,
+        "overall_steps": overall_steps,
+    }
 
-elif bench_tag == "mt50-ml45split-v3":
-    # Use ML45 env-name split to assign MT50 task_ids
-    train_tasks_list, test_tasks_list = [], []
-    for tid in successful_task_ids:
-        env_name = task_id_to_env[tid]  # for MT50 this is the env_name
-        if env_name in ml45_train_envs:
-            train_tasks_list.append(tid)
-        elif env_name in ml45_test_envs:
-            test_tasks_list.append(tid)
-        else:
-            # Fallback: env not present in ML45 split -> assign to train
-            train_tasks_list.append(tid)
-else:
-    # Plain MT50/MT10: all train
-    train_tasks_list = successful_task_ids
-    test_tasks_list  = []
 
-# =================== Config file =======================
-task_id_to_env_str_keys = {str(k): v for k, v in task_id_to_env.items()}
+def split_tasks(
+    bench_tag,
+    successful_task_ids,
+    task_id_to_env,
+    rng,
+    ml45_train_envs=None,
+    ml45_test_envs=None,
+):
+    """Apply the benchmark-specific train/test split."""
+    if bench_tag.startswith("ml1-v3"):
+        all_ids = np.array(successful_task_ids, dtype=int)
+        rng.shuffle(all_ids)
+        return (
+            all_ids[:TRAIN_COUNT_ML1].tolist(),
+            all_ids[TRAIN_COUNT_ML1:].tolist(),
+        )
 
-config = {
-    "env": bench_tag,  # e.g., "mt50-ml45split-v3"
-    "total_tasks": len(successful_task_ids),
-    "train_tasks": train_tasks_list,
-    "test_tasks": test_tasks_list,
-    "task_id_to_env": task_id_to_env_str_keys,  # e.g., {"13": "reach-v3"}
-    "env_to_task_ids": env_to_task_ids          # e.g., {"reach-v3": [13, ...]}
-}
-with open(os.path.join(config_dir, f"{bench_tag}.json"), "w") as f:
-    json.dump(config, f, indent=4)
+    if bench_tag == "mt50-ml45split-v3":
+        train_tasks = []
+        test_tasks = []
+        for task_id in successful_task_ids:
+            env_name = task_id_to_env[task_id]
+            if env_name in ml45_train_envs:
+                train_tasks.append(task_id)
+            elif env_name in ml45_test_envs:
+                test_tasks.append(task_id)
+            else:
+                train_tasks.append(task_id)
+        return train_tasks, test_tasks
 
-# =================== Stats (per-env & overall) =========
-stats = {
-    "per_env": {
-        env: {
-            "successful_episodes": env_stats[env]["count"],
-            "avg_return": safe_mean(env_stats[env]["returns"]),
-            "avg_steps": safe_mean(env_stats[env]["steps"]),
-            "min_steps": safe_min(env_stats[env]["steps"]),
-            "max_steps": safe_max(env_stats[env]["steps"]),
-        }
-        for env in env_names
-    },
-    "overall": {
-        "total_successful_episodes": int(sum(s["count"] for s in env_stats.values())),
-        "avg_return": safe_mean(overall_returns),
-        "avg_steps": safe_mean(overall_steps),
-        "min_steps": safe_min(overall_steps),
-        "max_steps": safe_max(overall_steps),
-    },
-}
-with open(os.path.join(config_dir, f"{bench_tag}-stats.json"), "w") as f:
-    json.dump(stats, f, indent=4)
+    return successful_task_ids, []
 
-print(f"\n✅ Done. Saved {len(successful_task_ids)} successful tasks for {bench_tag}.")
-if bench_tag == "mt50-ml45split-v3":
-    print(f"  ↳ Train (ML45 envs): {len(train_tasks_list)} tasks | Test (ML45 envs): {len(test_tasks_list)} tasks")
-print("📊 Stats summary (successful episodes only):")
-print(json.dumps(stats["overall"], indent=2))
+
+def build_config(bench_tag, collected, train_tasks, test_tasks):
+    """Build the task configuration consumed by training."""
+    return {
+        "env": bench_tag,
+        "total_tasks": len(collected["successful_task_ids"]),
+        "train_tasks": train_tasks,
+        "test_tasks": test_tasks,
+        "task_id_to_env": {
+            str(key): value for key, value in collected["task_id_to_env"].items()
+        },
+        "env_to_task_ids": collected["env_to_task_ids"],
+    }
+
+
+def build_stats(collected):
+    """Build per-environment and overall successful-episode statistics."""
+    env_stats = collected["env_stats"]
+    return {
+        "per_env": {
+            env_name: {
+                "successful_episodes": env_stats[env_name]["count"],
+                "avg_return": safe_mean(env_stats[env_name]["returns"]),
+                "avg_steps": safe_mean(env_stats[env_name]["steps"]),
+                "min_steps": safe_min(env_stats[env_name]["steps"]),
+                "max_steps": safe_max(env_stats[env_name]["steps"]),
+            }
+            for env_name in collected["env_names"]
+        },
+        "overall": {
+            "total_successful_episodes": int(
+                sum(values["count"] for values in env_stats.values())
+            ),
+            "avg_return": safe_mean(collected["overall_returns"]),
+            "avg_steps": safe_mean(collected["overall_steps"]),
+            "min_steps": safe_min(collected["overall_steps"]),
+            "max_steps": safe_max(collected["overall_steps"]),
+        },
+    }
+
+
+def write_json(path, contents):
+    with open(path, "w", encoding="utf-8") as output_file:
+        json.dump(contents, output_file, indent=4)
+
+
+def generate_expert_data(bench_name, seed=SEED):
+    """Generate trajectories, configuration, and statistics for a benchmark."""
+    benchmark, bench_tag = get_benchmark(bench_name, seed=seed)
+    config_dir = os.path.join("config", bench_tag)
+    data_dir = os.path.join("data", bench_tag)
+    os.makedirs(config_dir, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
+
+    ml45_train_envs = set()
+    ml45_test_envs = set()
+    if bench_tag == "mt50-ml45split-v3":
+        ml45_train_envs, ml45_test_envs = get_ml45_environment_split(
+            list(benchmark.train_classes.keys()), seed
+        )
+
+    collected = collect_successful_trajectories(benchmark, bench_tag, data_dir)
+    rng = np.random.RandomState(seed)
+    train_tasks, test_tasks = split_tasks(
+        bench_tag,
+        collected["successful_task_ids"],
+        collected["task_id_to_env"],
+        rng,
+        ml45_train_envs,
+        ml45_test_envs,
+    )
+
+    config = build_config(bench_tag, collected, train_tasks, test_tasks)
+    stats = build_stats(collected)
+    write_json(os.path.join(config_dir, f"{bench_tag}.json"), config)
+    write_json(os.path.join(config_dir, f"{bench_tag}-stats.json"), stats)
+
+    print(
+        f"\nDone. Saved {len(collected['successful_task_ids'])} "
+        f"successful tasks for {bench_tag}."
+    )
+    if bench_tag == "mt50-ml45split-v3":
+        print(
+            f"  Train (ML45 envs): {len(train_tasks)} tasks | "
+            f"Test (ML45 envs): {len(test_tasks)} tasks"
+        )
+    print("Stats summary (successful episodes only):")
+    print(json.dumps(stats["overall"], indent=2))
+    return config, stats
+
+
+def main():
+    args = build_parser().parse_args()
+    generate_expert_data(args.bench)
+
+
+if __name__ == "__main__":
+    main()
