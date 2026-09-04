@@ -1,4 +1,5 @@
-# Code backbone: Decision Transformer https://github.com/kzl/decision-transformer/
+# Code backbone: Prompt-DT https://github.com/mxu34/prompt-dt
+# Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
 # Decision Transformer License: https://github.com/kzl/decision-transformer/blob/master/LICENSE.md
 
 import numpy as np

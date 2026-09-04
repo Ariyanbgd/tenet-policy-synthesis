@@ -1,4 +1,6 @@
 # coding=utf-8
+# Code backbone: Prompt-DT https://github.com/mxu34/prompt-dt
+# Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
 # Copyright 2018 The OpenAI Team Authors and HuggingFace Inc. team.
 # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
 #

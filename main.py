@@ -9,7 +9,7 @@ import itertools
 import pickle
 import uuid
 
-from tenet.prompt_decision_transformer import Predictor
+from tenet.tenet import Predictor
 from tenet.prompt_seq_trainer import PromptSequenceTrainer
 from tenet.prompt_utils import get_env_list, set_seed, group_task_indices_by_type
 from tenet.prompt_utils import get_prompt_batch, get_prompt, get_batch, get_batch_finetune, flatten_prompt

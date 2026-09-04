@@ -1,3 +1,6 @@
+# Code backbone: Prompt-DT https://github.com/mxu34/prompt-dt
+# Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
+
 import numpy as np
 import json, pickle, random, os, torch
 from collections import namedtuple
