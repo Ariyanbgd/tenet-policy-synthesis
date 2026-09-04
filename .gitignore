@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local editor settings
+.vscode/
+
+# Experiment outputs and checkpoints
+results/
+model_saved/
+wandb/
+
+# Generated plots
+/*.pdf
+!/IJCAI__ECAI_26_TENET_Camera_Ready_Version.pdf
+
