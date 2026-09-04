@@ -155,8 +155,8 @@ def build_parser():
         description="Run one or more TENET experiments on Meta-World."
     )
     parser.add_argument(
-        "--benchmark", nargs="+", default=["ml1-pick-place"], metavar="NAME",
-        help="Benchmark preset(s), or 'all' (default: ml1-pick-place).",
+        "--benchmark", nargs="+", default=["mt10"], metavar="NAME",
+        help="Benchmark preset(s), or 'all' (default: mt10).",
     )
     parser.add_argument(
         "--method", nargs="+", default=["tenet_contrast"], metavar="NAME",
@@ -182,8 +182,12 @@ def build_parser():
     )
     parser.add_argument(
         "--generate-expert-data",
-        action="store_true",
-        help="Generate a selected benchmark when its dataset is incomplete.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Generate a selected benchmark when its dataset is incomplete "
+            "(default: enabled)."
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -245,29 +249,47 @@ def build_experiment_config(benchmark_name, method_name, seed, overrides):
 
 
 def find_missing_expert_data(env):
-    """Return missing config/data paths for a benchmark."""
-    config_path = os.path.join("config", env, f"{env}.json")
+    """Return missing or invalid config/data paths for a benchmark."""
+    config_dir = os.path.join("config", env)
+    config_path = os.path.join(config_dir, f"{env}.json")
+    stats_path = os.path.join(config_dir, f"{env}-stats.json")
+    problems = []
+
     if not os.path.isfile(config_path):
         return [config_path]
+    if not os.path.isfile(stats_path) or os.path.getsize(stats_path) == 0:
+        problems.append(stats_path)
 
     try:
         with open(config_path, "r", encoding="utf-8") as config_file:
             task_config = json.load(config_file)
-        task_ids = task_config["train_tasks"] + task_config["test_tasks"]
+        if task_config.get("env") != env:
+            problems.append(f"{config_path} (incorrect env field)")
+        train_tasks = task_config["train_tasks"]
+        test_tasks = task_config["test_tasks"]
         task_id_to_env = task_config["task_id_to_env"]
+        if not isinstance(train_tasks, list) or not isinstance(test_tasks, list):
+            raise TypeError("train_tasks and test_tasks must be lists")
+        if set(train_tasks) & set(test_tasks):
+            problems.append(f"{config_path} (train/test tasks overlap)")
+        task_ids = train_tasks + test_tasks
+        if len(task_ids) != len(set(task_ids)):
+            problems.append(f"{config_path} (duplicate task IDs)")
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-        raise RuntimeError(f"Invalid benchmark configuration {config_path}: {error}") from error
+        return [f"{config_path} (invalid: {error})"]
 
-    missing = []
     data_dir = os.path.join("data", env)
     for task_id in task_ids:
-        env_type = task_id_to_env[str(task_id)]
+        env_type = task_id_to_env.get(str(task_id))
+        if not env_type:
+            problems.append(f"{config_path} (no environment for task {task_id})")
+            continue
         stem = f"{env}-{env_type}-{task_id}"
         for suffix in ("expert.pkl", "prompt-expert.pkl"):
-            path = os.path.join(data_dir, f"{stem}-{suffix}")
-            if not os.path.isfile(path):
-                missing.append(path)
-    return missing
+            data_path = os.path.join(data_dir, f"{stem}-{suffix}")
+            if not os.path.isfile(data_path) or os.path.getsize(data_path) == 0:
+                problems.append(data_path)
+    return problems
 
 
 def ensure_expert_data(env, generate_if_missing=False):
@@ -294,7 +316,7 @@ def ensure_expert_data(env, generate_if_missing=False):
         preview += f"\n  ... and {remainder} more missing file(s)"
     raise FileNotFoundError(
         f"Expert data for '{env}' is missing or incomplete:\n{preview}\n"
-        "Generate it with --generate-expert-data, for example:\n"
+        "Automatic generation was disabled. Generate it with:\n"
         f"  {sys.executable} train.py --benchmark "
         f"{next(name for name, item in BENCHMARKS.items() if item['env'] == env)} "
         "--method tenet_contrast --generate-expert-data"
