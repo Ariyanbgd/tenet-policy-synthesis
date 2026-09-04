@@ -1,3 +1,4 @@
+import argparse
 import os
 import pickle
 import json
@@ -7,8 +8,21 @@ from metaworld.policies import ENV_POLICY_MAP
 
 # ======================= Config =======================
 SEED = 1
-# Options: "mt10-v3", "mt50-v3", "mt50-ml45split-v3", or "ml1-v3-pick-place-v3"
-BENCH = "mt50-ml45split-v3"
+SUPPORTED_BENCHMARKS = (
+    "ml1-v3-pick-place-v3",
+    "mt10-v3",
+    "mt50-v3",
+    "mt50-ml45split-v3",
+)
+
+parser = argparse.ArgumentParser(description="Generate Meta-World expert datasets.")
+parser.add_argument(
+    "--bench",
+    choices=SUPPORTED_BENCHMARKS,
+    default="mt50-ml45split-v3",
+    help="Benchmark to generate (default: mt50-ml45split-v3).",
+)
+BENCH = parser.parse_args().bench
 
 TAIL_STEPS_AFTER_SUCCESS = 2
 PROMPT_LAST_STEPS = 5

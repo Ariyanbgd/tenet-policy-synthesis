@@ -5,7 +5,10 @@ This module assembles configurations only. Training remains implemented in
 """
 
 import argparse
+import json
 import os
+import subprocess
+import sys
 from datetime import datetime
 
 
@@ -178,8 +181,13 @@ def build_parser():
         help="Override checkpoint saving for every selected run.",
     )
     parser.add_argument(
+        "--generate-expert-data",
+        action="store_true",
+        help="Generate a selected benchmark when its dataset is incomplete.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print selected runs without starting training.",
+        help="Print selected runs without checking data or starting training.",
     )
     parser.add_argument(
         "--list", action="store_true", help="List available presets and exit."
@@ -236,6 +244,63 @@ def build_experiment_config(benchmark_name, method_name, seed, overrides):
     return config
 
 
+def find_missing_expert_data(env):
+    """Return missing config/data paths for a benchmark."""
+    config_path = os.path.join("config", env, f"{env}.json")
+    if not os.path.isfile(config_path):
+        return [config_path]
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            task_config = json.load(config_file)
+        task_ids = task_config["train_tasks"] + task_config["test_tasks"]
+        task_id_to_env = task_config["task_id_to_env"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError(f"Invalid benchmark configuration {config_path}: {error}") from error
+
+    missing = []
+    data_dir = os.path.join("data", env)
+    for task_id in task_ids:
+        env_type = task_id_to_env[str(task_id)]
+        stem = f"{env}-{env_type}-{task_id}"
+        for suffix in ("expert.pkl", "prompt-expert.pkl"):
+            path = os.path.join(data_dir, f"{stem}-{suffix}")
+            if not os.path.isfile(path):
+                missing.append(path)
+    return missing
+
+
+def ensure_expert_data(env, generate_if_missing=False):
+    """Validate a dataset and optionally invoke the expert-data generator."""
+    missing = find_missing_expert_data(env)
+    if not missing:
+        print(f"Expert data ready: {env}")
+        return
+
+    if generate_if_missing:
+        print(f"Expert data incomplete for {env}; starting generation.")
+        subprocess.run(
+            [sys.executable, "expert_data_generation.py", "--bench", env],
+            check=True,
+        )
+        missing = find_missing_expert_data(env)
+        if not missing:
+            print(f"Expert data generated successfully: {env}")
+            return
+
+    preview = "\n".join(f"  - {path}" for path in missing[:5])
+    remainder = len(missing) - min(len(missing), 5)
+    if remainder:
+        preview += f"\n  ... and {remainder} more missing file(s)"
+    raise FileNotFoundError(
+        f"Expert data for '{env}' is missing or incomplete:\n{preview}\n"
+        "Generate it with --generate-expert-data, for example:\n"
+        f"  {sys.executable} train.py --benchmark "
+        f"{next(name for name, item in BENCHMARKS.items() if item['env'] == env)} "
+        "--method tenet_contrast --generate-expert-data"
+    )
+
+
 def print_run(run_number, total_runs, benchmark_name, method_name, config):
     print(f"\n[{run_number}/{total_runs}] {benchmark_name} / {method_name}")
     print(
@@ -263,6 +328,12 @@ def main():
     total_runs = len(benchmarks) * len(methods) * len(cli_args.seeds)
     if cli_args.dry_run:
         print(f"Dry run: {total_runs} experiment(s) selected.")
+    else:
+        for benchmark_name in benchmarks:
+            ensure_expert_data(
+                BENCHMARKS[benchmark_name]["env"],
+                generate_if_missing=cli_args.generate_expert_data,
+            )
 
     run_number = 0
     for benchmark_name in benchmarks:
