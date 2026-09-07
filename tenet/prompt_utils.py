@@ -1,6 +1,12 @@
 # Code backbone: Prompt-DT https://github.com/mxu34/prompt-dt
 # Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
 
+"""Environment, prompt, batch, dataset, and evaluation utilities.
+
+These helpers retain Prompt-DT's trajectory-processing pipeline and extend it
+with Meta-World task descriptions, text batches, and TENET policy evaluation.
+"""
+
 import numpy as np
 import json, pickle, random, os, torch
 from collections import namedtuple
@@ -80,6 +86,7 @@ MT10_TASK_DESCRIPTIONS = {
 }
 
 def describe_pick_and_place(goal):
+    """Create coordinate-specific descriptions for an ML1 pick-place goal."""
     tgt_pos = goal[3:]
 
     templates = [
@@ -93,7 +100,8 @@ def describe_pick_and_place(goal):
 """ constructing envs """
 
 def describe_reach(goal):
-    # Assumes the last 3 elements are the target position (x, y, z)
+    """Create coordinate-specific descriptions for an ML1 reach goal."""
+    # Meta-World stores the target position in the final three values.
     tx, ty, tz = goal[-3:]
 
     templates = [
@@ -103,8 +111,9 @@ def describe_reach(goal):
     return [t.format(tx=tx, ty=ty, tz=tz) for t in templates]
 
 def gen_env(env_name, base_env):
+    """Reconstruct one task instance and its evaluation metadata."""
     if env_name.startswith('mt50-v3-'):
-        # Example: 'mt50-v3-reach-v2-0'
+        # Format: mt50-v3-<task-name>-<task-index>.
         parts = env_name.split('-')
         task_name = '-'.join(parts[2:-1])  # 'reach-v2'
         task_idx = int(parts[-1])          # 0
@@ -126,7 +135,7 @@ def gen_env(env_name, base_env):
         scale = 650.0
         text_descriptions = MT50_TASK_DESCRIPTIONS.get(task_name, f"Perform the task: {task_name}")
     elif env_name.startswith('mt50-ml45split-v3-'):
-        # Example: 'mt50-ml45split-v3-reach-v2-0'
+        # Format: mt50-ml45split-v3-<task-name>-<task-index>.
         parts = env_name.split('-')
         task_name = '-'.join(parts[3:-1])  # 'reach-v2'
         task_idx = int(parts[-1])          # 0
@@ -214,6 +223,7 @@ def gen_env(env_name, base_env):
 
 
 def get_env_list(env_name_list, config_save_path, device):
+    """Construct a benchmark once and collect metadata for all task instances."""
     info = {} 
     
     if len(env_name_list)>0 and env_name_list[0].startswith('mt50-v3-'):
@@ -248,6 +258,7 @@ def get_env_list(env_name_list, config_save_path, device):
 """ prompts """
 
 def flatten_prompt(prompt, batch_size):
+    """Merge prompt episodes into one sequence per batch item."""
     p_s, p_a, p_r, p_d, p_rtg, p_timesteps, p_mask = prompt
     p_s = p_s.reshape((batch_size, -1, p_s.shape[-1]))
     p_a = p_a.reshape((batch_size, -1, p_a.shape[-1]))
@@ -261,18 +272,18 @@ def flatten_prompt(prompt, batch_size):
 
 
 def get_prompt(prompt_trajectories, info, variant):
+    """Build a callable that samples and pads trajectory prompts."""
     num_trajectories, p_sample, sorted_inds = info['num_trajectories'], info['p_sample'], info['sorted_inds']
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
     num_episodes, max_len = variant['prompt_episode'], variant['prompt_length']
 
     def fn(sample_size=1):
-        # random sample prompts with fixed length (prompt-length) in num episodes (prompt-episode)
+        # Sample the configured number of fixed-length prompt episodes.
         batch_inds = np.random.choice(
             np.arange(len(prompt_trajectories)),
             size=int(num_episodes*sample_size),
             replace=True,
-            # p=p_sample,  # reweights so we sample according to timesteps
         )
 
         s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []
@@ -281,10 +292,9 @@ def get_prompt(prompt_trajectories, info, variant):
                 traj = prompt_trajectories[int(batch_inds[i])] # random select traj
             else:
                 traj = prompt_trajectories[int(sorted_inds[-i])] # select the best traj with highest rewards
-                # traj = prompt_trajectories[i]
             si = max(0, traj['rewards'].shape[0] - max_len -1) # select the last traj with length max_len
 
-            # get sequences from dataset
+            # Slice state, action, reward, done, timestep, and return-to-go sequences.
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
             a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
@@ -298,10 +308,8 @@ def get_prompt(prompt_trajectories, info, variant):
             if rtg[-1].shape[1] <= s[-1].shape[1]:
                 rtg[-1] = np.concatenate([rtg[-1], np.zeros((1, 1, 1))], axis=1)
 
-            # padding and state + reward normalization
+            # Left-pad every sequence and normalize states/returns as configured.
             tlen = s[-1].shape[1]
-            # if tlen !=args.K:
-            #     print('tlen not equal to k')
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             if not variant['no_state_normalize']:
                 s[-1] = (s[-1] - state_mean) / state_std
@@ -325,6 +333,7 @@ def get_prompt(prompt_trajectories, info, variant):
 
 
 def get_text(info, variant):
+    """Build a callable that samples raw descriptions or cached embeddings."""
     batch_size = variant['batch_size']
     use_preencoded = variant.get('llm_preencoded', False)
 
@@ -345,6 +354,7 @@ def get_text(info, variant):
     return fn
 
 def get_goal(info, variant):
+    """Build a callable that repeats the task goal for a batch."""
     batch_size = variant['batch_size']
     device = info['device']
 
@@ -359,6 +369,7 @@ def get_goal(info, variant):
     return fn
 
 def get_prompt_batch(trajectories_list, prompt_trajectories_list, info, variant, train_env_name_list, train_env_name_grouped):
+    """Build a callable that samples a mixed-task training batch."""
     per_env_batch_size = 1 
     llm_goal_prediction = variant['llm_goal_prediction']
 
@@ -421,7 +432,7 @@ def get_prompt_batch(trajectories_list, prompt_trajectories_list, info, variant,
                 goal_list.append(goal)
                 
 
-        # Concatenate all collected samples
+        # Combine one sample from each selected task into a mixed-task batch.
         p_s, p_a, p_r, p_d = torch.cat(p_s_list, dim=0), torch.cat(p_a_list, dim=0), torch.cat(p_r_list, dim=0), torch.cat(p_d_list, dim=0)
         p_rtg, p_timesteps, p_mask = torch.cat(p_rtg_list, dim=0), torch.cat(p_timesteps_list, dim=0), torch.cat(p_mask_list, dim=0)
         s, a, r, d = torch.cat(s_list, dim=0), torch.cat(a_list, dim=0), torch.cat(r_list, dim=0), torch.cat(d_list, dim=0)
@@ -439,6 +450,7 @@ def get_prompt_batch(trajectories_list, prompt_trajectories_list, info, variant,
 """ batches """
 
 def get_batch(trajectories, info, variant):
+    """Build a callable that samples padded trajectory subsequences."""
     num_trajectories, p_sample, sorted_inds = info['num_trajectories'], info['p_sample'], info['sorted_inds']
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
@@ -449,21 +461,19 @@ def get_batch(trajectories, info, variant):
             np.arange(num_trajectories),
             size=batch_size,
             replace=True,
-            p=p_sample,  # reweights so we sample according to timesteps
+            p=p_sample,  # Sample timesteps uniformly across variable-length trajectories.
         )
 
         s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []
         for i in range(batch_size):
             traj = trajectories[int(sorted_inds[batch_inds[i]])]
-            # si = random.randint(0, traj['rewards'].shape[0] - 1)
-            # si = random.randint(0, traj['rewards'].shape[0] - 1 - max_len)
 
             if traj['rewards'].shape[0] <= max_len:
                 si = 0
             else:
                 si = random.randint(0, traj['rewards'].shape[0] - 1 - max_len)
 
-            # get sequences from dataset
+            # Slice state, action, reward, done, timestep, and return-to-go sequences.
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
             a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
@@ -477,10 +487,8 @@ def get_batch(trajectories, info, variant):
             if rtg[-1].shape[1] <= s[-1].shape[1]:
                 rtg[-1] = np.concatenate([rtg[-1], np.zeros((1, 1, 1))], axis=1)
 
-            # padding and state + reward normalization
+            # Left-pad every sequence and normalize states/returns as configured.
             tlen = s[-1].shape[1]
-            # if tlen !=args.K:
-            #     print('tlen not equal to k')
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             if not variant['no_state_normalize']:
                 s[-1] = (s[-1] - state_mean) / state_std
@@ -497,7 +505,7 @@ def get_batch(trajectories, info, variant):
         d = torch.from_numpy(np.concatenate(d, axis=0)).to(dtype=torch.long, device=device)
         rtg = torch.from_numpy(np.concatenate(rtg, axis=0)).to(dtype=torch.float32, device=device)
         timesteps = torch.from_numpy(np.concatenate(timesteps, axis=0)).to(dtype=torch.long, device=device)
-        mask = torch.from_numpy(np.concatenate(mask, axis=0)).to(device=device) # TODO: why mask only has several zeros
+        mask = torch.from_numpy(np.concatenate(mask, axis=0)).to(device=device) # Zeros mark left-padding positions.
 
         return s, a, r, d, rtg, timesteps, mask
 
@@ -505,17 +513,18 @@ def get_batch(trajectories, info, variant):
 
 
 def get_batch_finetune(trajectories, info, variant):
+    """Build the legacy prompt-length batch sampler used for fine-tuning."""
     num_trajectories, p_sample, sorted_inds = info['num_trajectories'], info['p_sample'], info['sorted_inds']
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
-    batch_size, K = variant['batch_size'], variant['prompt_length'] # use the same amount of data for funetuning
+    batch_size, K = variant['batch_size'], variant['prompt_length'] # Match fine-tuning context to the prompt length.
 
     def fn(batch_size=batch_size, max_len=K):
         batch_inds = np.random.choice(
             np.arange(num_trajectories),
             size=batch_size,
             replace=True,
-            p=p_sample,  # reweights so we sample according to timesteps
+            p=p_sample,  # Sample timesteps uniformly across variable-length trajectories.
         )
 
         s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []
@@ -524,7 +533,7 @@ def get_batch_finetune(trajectories, info, variant):
             si = random.randint(0, traj['rewards'].shape[0] - 1)
             si = max(0, traj['rewards'].shape[0] - max_len -1) # select the last traj with length max_len
 
-            # get sequences from dataset
+            # Slice state, action, reward, done, timestep, and return-to-go sequences.
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
             a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
@@ -538,10 +547,8 @@ def get_batch_finetune(trajectories, info, variant):
             if rtg[-1].shape[1] <= s[-1].shape[1]:
                 rtg[-1] = np.concatenate([rtg[-1], np.zeros((1, 1, 1))], axis=1)
 
-            # padding and state + reward normalization
+            # Left-pad every sequence and normalize states/returns as configured.
             tlen = s[-1].shape[1]
-            # if tlen !=args.K:
-            #     print('tlen not equal to k')
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             if not variant['no_state_normalize']:
                 s[-1] = (s[-1] - state_mean) / state_std
@@ -558,7 +565,7 @@ def get_batch_finetune(trajectories, info, variant):
         d = torch.from_numpy(np.concatenate(d, axis=0)).to(dtype=torch.long, device=device)
         rtg = torch.from_numpy(np.concatenate(rtg, axis=0)).to(dtype=torch.float32, device=device)
         timesteps = torch.from_numpy(np.concatenate(timesteps, axis=0)).to(dtype=torch.long, device=device)
-        mask = torch.from_numpy(np.concatenate(mask, axis=0)).to(device=device) # TODO: why mask only has several zeros
+        mask = torch.from_numpy(np.concatenate(mask, axis=0)).to(device=device) # Zeros mark left-padding positions.
 
         return s, a, r, d, rtg, timesteps, mask
 
@@ -567,8 +574,9 @@ def get_batch_finetune(trajectories, info, variant):
 """ data processing """
 
 def process_total_data_mean(trajectories, mode):
+    """Compute shared state-normalization statistics across trajectories."""
 
-    # save all path information into separate lists
+    # Collect trajectory lengths, returns, and observations.
     states, traj_lens, returns = [], [], []
     for path in trajectories:
         if mode == 'delayed':  # delayed: all rewards moved to end of trajectory
@@ -579,7 +587,7 @@ def process_total_data_mean(trajectories, mode):
         returns.append(path['rewards'].sum())
     traj_lens, returns = np.array(traj_lens), np.array(returns)
 
-    # used for input normalization
+    # Compute state statistics used for input normalization.
     states = np.concatenate(states, axis=0)
     state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
 
@@ -587,7 +595,8 @@ def process_total_data_mean(trajectories, mode):
 
 
 def process_dataset(trajectories, mode, env_name, dataset, pct_traj):
-    # save all path information into separate lists
+    """Compute per-task trajectory sampling and normalization metadata."""
+    # Collect trajectory lengths, returns, and observations.
     states, traj_lens, returns = [], [], []
     for path in trajectories:
         if mode == 'delayed':  # delayed: all rewards moved to end of trajectory
@@ -598,7 +607,7 @@ def process_dataset(trajectories, mode, env_name, dataset, pct_traj):
         returns.append(path['rewards'].sum())
     traj_lens, returns = np.array(traj_lens), np.array(returns)
 
-    # used for input normalization
+    # Compute state statistics used for input normalization.
     states = np.concatenate(states, axis=0)
     state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
 
@@ -611,7 +620,7 @@ def process_dataset(trajectories, mode, env_name, dataset, pct_traj):
     print(f'Max return: {np.max(returns):.2f}, min: {np.min(returns):.2f}')
     print('=' * 50)
 
-    # only train on top pct_traj trajectories (for %BC experiment)
+    # Retain the highest-return trajectories up to the requested timestep share.
     num_timesteps = max(int(pct_traj * num_timesteps), 1)
     sorted_inds = np.argsort(returns)  # lowest to highest
     num_trajectories = 1
@@ -623,7 +632,7 @@ def process_dataset(trajectories, mode, env_name, dataset, pct_traj):
         ind -= 1
     sorted_inds = sorted_inds[-num_trajectories:]
 
-    # used to reweight sampling so we sample according to timesteps instead of trajectories
+    # Weight trajectory sampling by length rather than uniformly by trajectory.
     p_sample = traj_lens[sorted_inds] / sum(traj_lens[sorted_inds])
     reward_info = [np.mean(returns), np.std(returns), np.max(returns), np.min(returns)]
 
@@ -631,6 +640,7 @@ def process_dataset(trajectories, mode, env_name, dataset, pct_traj):
 
 
 def load_data_prompt(env_name_list, data_save_path, dataset, prompt_mode, args):
+    """Load full and prompt trajectory files for each task instance."""
     trajectories_list = []
     prompt_trajectories_list = []
     for env_name in env_name_list:
@@ -643,22 +653,20 @@ def load_data_prompt(env_name_list, data_save_path, dataset, prompt_mode, args):
         trajectories_list.append(trajectories)
         prompt_trajectories_list.append(prompt_trajectories)
     
-    # print('traj path:')
-    # print(dataset_path)
-    # print('prompt traj path')
-    # print(prompt_dataset_path)
-    # print()
     return trajectories_list, prompt_trajectories_list
 
 
 def round_to_100(x):
+    """Round upward to a capped multiple of 100."""
     return min(500, int(math.ceil(x / 100.0) * 100))
 
 def round_to_50(x):
+    """Round to the nearest multiple of 50."""
     return int(np.round(x / 50.0) * 50)
 
 def process_info(env_name_list, env_name_group, trajectories_list, info, mode, dataset, pct_traj, variant):
-    # Step 1: Per env_name_list[i], process stats
+    # Compute sampling and normalization metadata independently per task.
+    """Attach dataset sampling and normalization metadata to each task."""
     for i, env_name in enumerate(env_name_list):
         trajectories, num_trajectories, sorted_inds, p_sample, state_mean, state_std, reward_info = process_dataset(
             trajectories=trajectories_list[i],
@@ -673,36 +681,13 @@ def process_info(env_name_list, env_name_group, trajectories_list, info, mode, d
         info[env_name]['p_sample'] = p_sample
         info[env_name]['state_mean'] = variant['total_state_mean'] if variant['average_state_mean'] else state_mean
         info[env_name]['state_std'] = variant['total_state_std'] if variant['average_state_mean'] else state_std
-        info[env_name]['trajectories'] = trajectories  # temp for aggregation
-
-    # Step 2: Per-task-type aggregation
-    # for task_type, indices in env_name_group.items():
-    #     all_returns = []
-    #     all_lengths = []
-
-    #     for idx in indices:
-    #         env_name = env_name_list[idx]
-    #         trajectories = info[env_name]['trajectories']
-    #         for traj in trajectories:
-    #             all_lengths.append(len(traj['observations']))
-    #             all_returns.append(np.sum(traj['rewards']))
-
-    #     max_ep_len_raw = np.max(all_lengths)
-    #     target_return_raw = np.max(all_returns)
-    #     max_ep_len = round_to_50(max_ep_len_raw + 50)
-    #     target_return = round_to_50(target_return_raw)
-
-    #     for idx in indices:
-    #         env_name = env_name_list[idx]
-    #         info[env_name]['max_ep_len'] = max_ep_len
-    #         info[env_name]['env_targets'] = [target_return]
-    #         info[env_name]['scale'] = target_return
-    #         del info[env_name]['trajectories']
+        info[env_name]['trajectories'] = trajectories  # Retained for legacy consumers.
 
     return info
 
 
 def discount_cumsum(x, gamma):
+    """Compute discounted cumulative sums from the end of a sequence."""
     discount_cumsum = np.zeros_like(x)
     discount_cumsum[-1] = x[-1]
     for t in reversed(range(x.shape[0] - 1)):
@@ -712,6 +697,7 @@ def discount_cumsum(x, gamma):
 """ evaluation """
 
 def eval_episodes(target_rew, info, variant, env, env_name):
+    """Build a trajectory-conditioned multi-episode evaluator."""
     max_ep_len, state_mean, state_std, scale = info['max_ep_len'], info['state_mean'], info['state_std'], info['scale']
     state_dim, act_dim, device = info['state_dim'], info['act_dim'], info['device']
     num_eval_episodes = variant['num_eval_episodes']
@@ -750,6 +736,7 @@ def eval_episodes(target_rew, info, variant, env, env_name):
     return fn
 
 def eval_episodes_llm(info, variant, env, env_name):
+    """Build an evaluator for a policy instantiated from task text."""
     max_ep_len, state_mean, state_std = info['max_ep_len'], info['state_mean'], info['state_std']
     device = info['device']
     num_eval_episodes = variant['num_eval_episodes']
@@ -795,6 +782,7 @@ def eval_episodes_llm(info, variant, env, env_name):
 
 def text_encoding(model, info, env_name_list,device):
 
+    """Cache final-token LLM embeddings for every task description."""
     all_text_embeddings = []
     
     for i, env_name in enumerate(env_name_list):
@@ -824,6 +812,7 @@ def text_encoding(model, info, env_name_list,device):
 
 
 def set_seed(seed):
+    """Seed Python, NumPy, PyTorch, and deterministic cuDNN behavior."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -832,9 +821,10 @@ def set_seed(seed):
     
     
 def group_task_indices_by_type(train_env_name_list):
+    """Group task-instance positions by their parsed task identifier."""
     grouped = defaultdict(list)
     for idx, env_name in enumerate(train_env_name_list):
-        # Extract task type: 'mt50-v3-assembly-v3-0' → 'assembly-v3'
+        # Remove the standard benchmark prefix and task-instance index.
         task_type = '-'.join(env_name.split('-')[2:-1])
         grouped[task_type].append(idx)
     return grouped
