@@ -1,7 +1,7 @@
 """Experiment launcher for the Meta-World portion of the TENET release.
 
 This module selects benchmarks and method presets, validates or generates the
-required expert data, and delegates training to ``main.experiment_mix_env``.
+required expert data, and delegates training to ``training.experiment_mix_env``.
 Configuration is applied in this order, with later values taking precedence:
 
     shared defaults -> benchmark preset -> method preset -> CLI overrides
@@ -99,7 +99,7 @@ METHODS = {
     },
 }
 
-# Shared defaults passed to main.experiment_mix_env. Options inherited from
+# Shared defaults passed to training.experiment_mix_env. Options inherited from
 # Prompt-DT are retained for compatibility, including those not used here.
 BASE_CONFIG = {
     # Dataset and trajectory-prompt settings
@@ -337,7 +337,7 @@ def ensure_expert_data(env, generate_if_missing=False):
     if generate_if_missing:
         print(f"Expert data incomplete for {env}; starting generation.")
         subprocess.run(
-            [sys.executable, "expert_data_generation.py", "--bench", env],
+            [sys.executable, "generate_expert_data.py", "--bench", env],
             check=True,
         )
         missing = find_missing_expert_data(env)
@@ -411,7 +411,7 @@ def main():
                     continue
 
                 # Keep listing/dry runs lightweight by importing training lazily.
-                from main import experiment_mix_env
+                from training import experiment_mix_env
 
                 run_dir = os.path.join(
                     base_result_dir, method_name, f"seed{seed}_{timestamp}"
