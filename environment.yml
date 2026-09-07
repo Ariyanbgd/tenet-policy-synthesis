@@ -1,0 +1,26 @@
+name: tenet
+
+channels:
+  - defaults
+
+dependencies:
+  - python=3.9.23
+  - pip=25.1
+  - pip:
+      # Match the CUDA 11.8 PyTorch build used for the released experiments.
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.7.1+cu118
+      - numpy==2.0.2
+      - scipy==1.13.1
+      - gymnasium==1.1.1
+      - mujoco==3.3.4
+      - transformers==4.33.0
+      - tokenizers==0.13.3
+      - huggingface-hub==0.34.3
+      - accelerate==1.9.0
+      - peft==0.13.2
+      - safetensors==0.5.3
+      - einops==0.8.1
+      - einx==0.3.0
+      - tqdm==4.67.1
+      - wandb==0.19.9

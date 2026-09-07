@@ -60,7 +60,20 @@ results/                    Run outputs and checkpoints (not tracked)
 
 ## Installation
 
-The code was tested with Python 3.9 and the following central dependencies:
+Create the tested Conda environment from the repository root:
+
+```bash
+conda env create --file environment.yml
+conda activate tenet
+```
+
+To update an existing environment after `environment.yml` changes:
+
+```bash
+conda env update --file environment.yml --prune
+```
+
+The environment uses Python 3.9 and the following central dependencies:
 
 ```text
 torch==2.7.1+cu118
@@ -74,10 +87,11 @@ einops==0.8.1
 scipy==1.13.1
 ```
 
-MuJoCo, PyTorch, and CUDA installation details depend on the operating system
-and GPU. A reproducible environment file will be added to this repository; in
-the meantime, use the versions above because the inherited transformer and
-Meta-World code are version-sensitive.
+The provided environment installs the CUDA 11.8 build of PyTorch used for the
+released experiments. A compatible NVIDIA driver is required. MuJoCo may also
+require system graphics libraries depending on the operating system. The
+inherited transformer and Meta-World code are version-sensitive, so begin with
+the provided environment before changing dependency versions.
 
 The TeNet presets use `meta-llama/Meta-Llama-3-8B` as a frozen text encoder.
 Ensure that the model is accessible from the machine running the experiment
