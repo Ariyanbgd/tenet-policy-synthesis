@@ -10,6 +10,10 @@ results/
 model_saved/
 wandb/
 
+# Generated expert datasets and benchmark configurations
+data/
+config/
+
 # Generated plots
 /*.pdf
 !/IJCAI__ECAI_26_TENET_Camera_Ready_Version.pdf
