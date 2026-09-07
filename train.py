@@ -1,7 +1,19 @@
 """Experiment launcher for the Meta-World portion of the TENET release.
 
-This module assembles configurations only. Training remains implemented in
-``main.experiment_mix_env``.
+This module selects benchmarks and method presets, validates or generates the
+required expert data, and delegates training to ``main.experiment_mix_env``.
+Configuration is applied in this order, with later values taking precedence:
+
+    shared defaults -> benchmark preset -> method preset -> CLI overrides
+
+Examples:
+    python train.py --list
+    python train.py --benchmark mt10 --method tenet_contrast
+    python train.py --benchmark mt10 mt50 --method dt prompt_dt
+    python train.py --benchmark all --method all --dry-run
+
+Expert data is generated automatically only when the selected dataset is
+missing or incomplete. Use ``--no-generate-expert-data`` for validation only.
 """
 
 import argparse
@@ -28,11 +40,22 @@ BENCHMARKS = {
     },
 }
 
-# Each preset contains only settings that distinguish that method. Values are
-# unchanged from the original launcher.
+METHOD_DESCRIPTIONS = {
+    "dt": "Decision Transformer without task prompts",
+    "prompt_dt": "Prompt-DT conditioned on expert trajectory prompts",
+    "tenet": "direct text-conditioned hypernetwork",
+    "tenet_contrast": "TENET with contrastive text-trajectory grounding",
+    "tenet_mse": "TENET with MSE text-trajectory grounding",
+}
+
+# Each preset contains only settings that distinguish that method. Shared
+# values belong in BASE_CONFIG so the scientific differences remain visible.
 METHODS = {
+    # Sequence baseline without a trajectory prompt.
     "dt": {"no_prompt": True, "log_to_wandb": True, "max_iters": 5000},
+    # Sequence baseline conditioned on an expert trajectory prompt.
     "prompt_dt": {"log_to_wandb": True, "max_iters": 5000},
+    # Direct TENET: text and trajectory branches use separate policies.
     "tenet": {
         "log_to_wandb": True,
         "hyper_network": True,
@@ -46,6 +69,7 @@ METHODS = {
         "dual_policy": True,
         "max_iters": 5000,
     },
+    # Grounded TENET: align text and trajectories contrastively.
     "tenet_contrast": {
         "log_to_wandb": True,
         "hyper_network": True,
@@ -59,6 +83,7 @@ METHODS = {
         "only_llm_evaluation": True,
         "max_iters": 5000,
     },
+    # Grounded TENET: align text and trajectories with MSE.
     "tenet_mse": {
         "log_to_wandb": True,
         "hyper_network": True,
@@ -77,6 +102,7 @@ METHODS = {
 # Shared defaults passed to main.experiment_mix_env. Options inherited from
 # Prompt-DT are retained for compatibility, including those not used here.
 BASE_CONFIG = {
+    # Dataset and trajectory-prompt settings
     "dataset_mode": "expert",
     "test_dataset_mode": "expert",
     "train_prompt_mode": "expert",
@@ -87,6 +113,7 @@ BASE_CONFIG = {
     "no_prompt": False,
     "no_r": False,
     "no_rtg": False,
+    # Prompt-DT fine-tuning and state preprocessing
     "finetune": False,
     "finetune_steps": 10,
     "finetune_batch_size": 256,
@@ -96,6 +123,7 @@ BASE_CONFIG = {
     "average_state_mean": True,
     "evaluation": False,
     "load_path": None,
+    # Language encoder and text-conditioned policy settings
     "llm": False,
     "delayed_llm": False,
     "delayed_llm_iteration": 2500,
@@ -110,6 +138,7 @@ BASE_CONFIG = {
     "llm_goal_prediction": False,
     "llm_goal_pred_coeff": 0.1,
     "only_llm_evaluation": False,
+    # Optional text-trajectory grounding objectives
     "use_embedding_contrastive": False,
     "use_text_embedding_contrastive": False,
     "contrastive_coeff": 1.0,
@@ -119,6 +148,7 @@ BASE_CONFIG = {
     "embedding_mse_coeff": 0.1,
     "use_embedding_discriminator": False,
     "discriminator_coeff": 0.1,
+    # Generated-policy and hypernetwork settings
     "hyper_network": False,
     "hn_embed_dim": 128,
     "hypernet_layers": [128, 128],
@@ -128,6 +158,7 @@ BASE_CONFIG = {
     "quantized_embed": False,
     "quantized_embed_for_loss": False,
     "quant_level": 21,
+    # Decision Transformer architecture and optimization
     "mode": "normal",
     "K": 20,
     "pct_traj": 1.0,
@@ -139,6 +170,7 @@ BASE_CONFIG = {
     "learning_rate": 1e-4,
     "weight_decay": 1e-4,
     "warmup_steps": 10000,
+    # Evaluation, logging, and checkpointing
     "num_eval_episodes": 1,
     "max_iters": 50000,
     "num_steps_per_iter": 10,
@@ -152,7 +184,10 @@ BASE_CONFIG = {
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Run one or more TENET experiments on Meta-World."
+        description=(
+            "Run TENET experiments on Meta-World. Selecting all benchmarks "
+            "and methods launches 20 runs per seed."
+        )
     )
     parser.add_argument(
         "--benchmark", nargs="+", default=["mt10"], metavar="NAME",
@@ -221,7 +256,7 @@ def print_available_presets():
         print(f"  {name:<18} {config['env']:<28} {note}")
     print("\nMethods:")
     for name in METHODS:
-        print(f"  {name}")
+        print(f"  {name:<18} {METHOD_DESCRIPTIONS[name]}")
 
 
 def get_runtime_overrides(cli_args):
@@ -351,6 +386,8 @@ def main():
     if cli_args.dry_run:
         print(f"Dry run: {total_runs} experiment(s) selected.")
     else:
+        # Validate each benchmark once, regardless of method or seed count.
+        # Generation runs only when validation reports missing/invalid files.
         for benchmark_name in benchmarks:
             ensure_expert_data(
                 BENCHMARKS[benchmark_name]["env"],
