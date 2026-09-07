@@ -2,6 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite the paper below."
 title: "TeNet: Text-to-Network for Compact Policy Synthesis"
 type: software
+license: MIT
 authors:
   - family-names: Bighashdel
     given-names: Ariyan

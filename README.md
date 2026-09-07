@@ -224,9 +224,11 @@ Hugging Face GPT-2-derived trajectory-model code. Please consult the upstream
 projects and the source headers for their respective copyright and license
 terms.
 
-Before redistributing a modified version of this repository, preserve all
-applicable upstream notices. A repository-level license and consolidated
-third-party notice are planned as part of the release preparation.
+TeNet's original contributions are released under the [MIT License](LICENSE).
+Bundled and derived components remain subject to their upstream terms; see
+[Third-party notices](THIRD_PARTY_NOTICES.md) for sources and included license
+copies. Preserve all applicable upstream notices when redistributing a modified
+version of this repository.
 
 ## Citation
 
