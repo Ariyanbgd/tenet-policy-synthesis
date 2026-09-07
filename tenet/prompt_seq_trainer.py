@@ -2,6 +2,13 @@
 # Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
 # Decision Transformer License: https://github.com/kzl/decision-transformer/blob/master/LICENSE.md
 
+"""Training and multi-task evaluation utilities for Prompt-DT and TENET.
+
+The trainer combines trajectory-conditioned imitation with the optional
+text-conditioned policy and grounding objectives used by the TENET variants.
+Legacy Prompt-DT fine-tuning paths are retained for compatibility.
+"""
+
 import numpy as np
 import torch
 import time
@@ -14,6 +21,7 @@ import torch.nn as nn
 import os
 
 class PromptSequenceTrainer:
+    """Coordinate optimization and evaluation across Meta-World tasks."""
 
     def __init__(self, args, model, optimizer, batch_size, get_batch, loss_fn,
                  scheduler=None, eval_fns=None, get_prompt=None, get_prompt_batch=None, device=None):
@@ -27,7 +35,7 @@ class PromptSequenceTrainer:
         self.eval_fns = [] if eval_fns is None else eval_fns
         self.diagnostics = dict()
         self.get_prompt = get_prompt
-        self.prompt = self.get_prompt() # sample prompt data when initialization
+        self.prompt = self.get_prompt() # Initial prompt used by legacy fine-tuning.
         self.get_prompt_batch = get_prompt_batch
         self.device = device
         self.save = False
@@ -45,6 +53,7 @@ class PromptSequenceTrainer:
 
 
     def pure_train_iteration_mix(self, num_steps, no_prompt=False, no_llm=True):
+        """Run several optimizer steps and aggregate their training metrics."""
 
         train_action_losses = []
         train_embedding_consistency_losses = []
@@ -99,6 +108,7 @@ class PromptSequenceTrainer:
 
 
     def train_step_mix(self, no_prompt=False, no_llm=True):
+        """Optimize trajectory and optional text-conditioned objectives once."""
         prompt, batch, text, goal = self.get_prompt_batch()
         states, actions, rewards, dones, rtg, timesteps, attention_mask = batch
         action_target = torch.clone(actions)
@@ -119,11 +129,11 @@ class PromptSequenceTrainer:
 
         loss = 0
 
-        # --- Action prediction loss from trajectory ---
+        # Imitation loss for the trajectory-conditioned policy.
         action_loss = self.loss_fn(None, action_preds, None, None, action_target, None)
         loss += action_loss
 
-        # --- Temporal embedding consistency loss ---
+        # Encourage adjacent trajectory embeddings to change smoothly.
         action_trajectory_embeddings_diff = action_trajectory_embeddings[:, 1:, :] - action_trajectory_embeddings[:, :-1, :]
         embedding_consistency_loss = torch.mean(action_trajectory_embeddings_diff.pow(2))
         if self.args.consistency_regularizer:
@@ -137,17 +147,17 @@ class PromptSequenceTrainer:
         text_contrastive_loss = torch.zeros_like(action_loss)
 
         if not no_llm:
-            # --- LLM-predicted action loss ---
+            # Imitation loss for the text-conditioned policy.
             action_llm_loss = self.loss_fn(None, action_preds_llm, None, None, action_target, None)
             loss += action_llm_loss
             
             if self.args.use_embedding_contrastive:
-                # --- Normalize embeddings if requested ---
+                # Contrastive similarity always operates on normalized embeddings.
                 if not self.args.normalize_embeddings:
                     text_embedding = F.normalize(text_embedding, dim=-1)
                     trajectory_embedding = F.normalize(trajectory_embedding, dim=-1)
 
-                # --- Contrastive Loss ---
+                # Symmetric text-to-trajectory and trajectory-to-text alignment.
                 logits = torch.matmul(trajectory_embedding, text_embedding.T) / self.args.contrastive_temperature
                 labels = torch.arange(logits.shape[0], device=logits.device)
                 loss_i2t = F.cross_entropy(logits, labels)
@@ -161,14 +171,14 @@ class PromptSequenceTrainer:
                     text_contrastive_loss = F.cross_entropy(logits_tt, labels_tt)
                     loss += self.args.text_contrastive_coeff * text_contrastive_loss
 
-            # === MSE Embedding Alignment Loss ===
+            # Direct text-trajectory alignment used by TENET-MSE.
             if self.args.use_embedding_mse:
                 embedding_mse_loss = F.mse_loss(trajectory_embedding, text_embedding)
                 loss += self.args.embedding_mse_coeff * embedding_mse_loss
 
-            # === Discriminator Loss ===
+            # Optional adversarial alignment retained from earlier experiments.
             if self.args.use_embedding_discriminator:
-                # Train discriminator: detach embeddings
+                # Train the discriminator without updating either encoder.
                 z_t = trajectory_embedding.detach()
                 z_s = text_embedding.detach()
                 logits_D = torch.cat([self.discriminator(z_t), self.discriminator(z_s)], dim=0).squeeze()
@@ -178,7 +188,7 @@ class PromptSequenceTrainer:
                 d_loss.backward()
                 self.d_optimizer.step()
 
-                # Train encoders to fool discriminator
+                # Then update the encoders to confuse the discriminator.
                 logits_fake = torch.cat([self.discriminator(trajectory_embedding), self.discriminator(text_embedding)], dim=0).squeeze()
                 fool_labels = torch.cat([torch.zeros(trajectory_embedding.size(0)), torch.ones(text_embedding.size(0))], dim=0).to(logits_fake.device)
                 discriminator_loss = F.binary_cross_entropy_with_logits(logits_fake, fool_labels)
@@ -189,13 +199,13 @@ class PromptSequenceTrainer:
                 llm_goal_pred_loss = F.mse_loss(goal_pred, goal)
                 loss += self.args.llm_goal_pred_coeff * llm_goal_pred_loss
 
-        # === Backward ===
+        # Optimize the combined enabled objectives.
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), .25)
         self.optimizer.step()
 
-        # === Logging ===
+        # Store action errors for the iteration-level diagnostics.
         with torch.no_grad():
             self.diagnostics['training/action_error'] = torch.mean((action_preds - action_target) ** 2).detach().cpu().item()
             self.diagnostics['training/action_error_llm'] = torch.mean((action_preds_llm - action_target) ** 2).detach().cpu().item()
@@ -209,6 +219,7 @@ class PromptSequenceTrainer:
                                 variant, env_list, iter_num=0, print_logs=False, 
                                 no_prompt=False, group='test-finetune',
                                 finetune_opt=False):
+        """Evaluate legacy per-task fine-tuning, restoring weights per task."""
         print('evaluate at tasks: ', env_name_list)
         logs = dict()
         print('start evaluating...')
@@ -234,7 +245,7 @@ class PromptSequenceTrainer:
                 self.prompt = None
 
             self.model.train()
-            # finetune the model on the data for this task 
+            # Adapt on the current task before evaluating it.
             finetune_losses = []
             for _ in range(variant['finetune_steps']):
                 finetune_loss = self.train_step(
@@ -243,7 +254,7 @@ class PromptSequenceTrainer:
                 finetune_losses.append(finetune_loss)
 
             self.model.eval()
-            # need to sample eval_fn and prompt together 
+            # Evaluate with the prompt sampled for this task.
             for eval_fn in self.eval_fns:
                 outputs = eval_fn(self.model, prompt=self.prompt)
                 for k, v in outputs.items():
@@ -266,15 +277,12 @@ class PromptSequenceTrainer:
 
 
     def train_step(self, batch_size_overwrite=None, optimizer=None):
+        """Run one legacy Prompt-DT optimization step for fine-tuning."""
         if batch_size_overwrite is not None:
             states, actions, rewards, dones, rtg, timesteps, attention_mask = self.get_batch(batch_size_overwrite)
         else:
             states, actions, rewards, dones, rtg, timesteps, attention_mask = self.get_batch(self.batch_size)
         action_target = torch.clone(actions)
-        # print('state shape after batch', states.shape)
-        # print('self.batch_size', self.batch_size)
-        # print('enter train step')
-        # input()
         state_preds, action_preds, reward_preds = self.model.forward(
             states, actions, rewards, rtg[:,:-1], timesteps, attention_mask=attention_mask, prompt=self.prompt
         )
@@ -311,6 +319,7 @@ class PromptSequenceTrainer:
                                 env_name_grouped, info, variant, base_env, iter_num=0,
                                 print_logs=False, no_prompt=False, group='test',
                                 log_per_task_instance=False):
+        """Evaluate trajectory and/or text policies across a task split."""
         print(f"[Eval-{group}] Evaluating {len(env_name_list)} task instances...")
         logs = dict()
         self.model.eval()
@@ -323,7 +332,7 @@ class PromptSequenceTrainer:
 
         for env_id, env_name in enumerate(env_name_list):
 
-            # ---- Build env ----
+            # Reconstruct the specific Meta-World task instance.
 
             task_name = info[env_name]["task_name"]
             task_idx = info[env_name]["task_idx"]
@@ -333,15 +342,15 @@ class PromptSequenceTrainer:
             env.set_task(task)
 
 
-            # ---- Build prompt once per env (works for both branches) ----
+            # Sample one trajectory prompt for this task instance.
             get_prompt_fn = get_prompt(prompt_trajectories_list[env_id], info[env_name], variant)
             prompt = None if no_prompt else flatten_prompt(get_prompt_fn(), batch_size=1)
 
-            # Placeholders
+            # A disabled evaluation branch is populated from the enabled one below.
             dt_policy_ret = dt_policy_succ = None
             llm_ret = llm_succ = None
 
-            # ---- Policy branch (non-LLM or full eval) ----
+            # Evaluate the trajectory-conditioned branch when requested.
             run_dt_policy = (not self.args.llm) or (self.args.llm and not self.args.only_llm_evaluation)
             if run_dt_policy:
                 eval_fns = [
@@ -353,23 +362,23 @@ class PromptSequenceTrainer:
                     _, avg_return, avg_success = eval_fn(self.model, prompt=prompt)
                     per_target_returns.append(avg_return)
                     per_target_successes.append(avg_success)
-                # Aggregate to one number per env
+                # Average across the configured return targets.
                 dt_policy_ret = float(np.mean(per_target_returns)) if per_target_returns else None
                 dt_policy_succ = float(np.mean(per_target_successes)) if per_target_successes else None
 
-            # ---- LLM branch ----
+            # Evaluate the compact policy instantiated from task text.
             if self.args.llm:
                 eval_fn_llm = eval_episodes_llm(info[env_name], variant, env, env_name)
                 text = info[env_name]['text_embeddings'] if self.args.llm_preencoded else info[env_name]['text_descriptions']
                 llm_ret, llm_succ = eval_fn_llm(self.model, text=text)
 
-            # ---- Fallbacks: copy whichever is missing ----
+            # Keep parallel metrics populated when only one branch is evaluated.
             if dt_policy_ret is None: dt_policy_ret = llm_ret
             if dt_policy_succ is None: dt_policy_succ = llm_succ
             if llm_ret is None: llm_ret = dt_policy_ret
             if llm_succ is None: llm_succ = dt_policy_succ
 
-            # ---- Append parallel arrays (always populated now) ----
+            # Store parallel task-level metrics for later aggregation.
             all_envs_avg_returns.append(dt_policy_ret)
             all_envs_avg_successes.append(dt_policy_succ)
             all_envs_avg_returns_llm.append(llm_ret)
@@ -384,13 +393,13 @@ class PromptSequenceTrainer:
                 logs[f'{group}/task_instance/{env_name}/return_llm'] = float(llm_ret)
                 logs[f'{group}/task_instance/{env_name}/success_llm'] = float(llm_succ)
 
-        # === Log overall averages ===
+        # Aggregate across every task instance in this split.
         logs[f'{group}/avg/return'] = float(np.mean(all_envs_avg_returns))
         logs[f'{group}/avg/success'] = float(np.mean(all_envs_avg_successes))
         logs[f'{group}/avg/return_llm'] = float(np.mean(all_envs_avg_returns_llm))
         logs[f'{group}/avg/success_llm'] = float(np.mean(all_envs_avg_successes_llm))
 
-        # === Per-task-type average ===
+        # Also aggregate instances that share a Meta-World task type.
         for task_type, indices in env_name_grouped.items():
             returns = [all_envs_avg_returns[i] for i in indices]
             successes = [all_envs_avg_successes[i] for i in indices]
@@ -418,16 +427,20 @@ class PromptSequenceTrainer:
 
  
     def save_model(self, save_path):
+        """Serialize the complete policy model."""
         model_path = os.path.join(save_path, 'model.pt')
         torch.save(self.model,model_path)  # model save
     
     def save_text_encoder(self, save_path):
+        """Serialize the text encoder separately from the policy."""
         model_path = os.path.join(save_path, 'model_text_encoder.pt')
         torch.save(self.model.text_encoder,model_path)  # model save
 
 
 
 class Discriminator(nn.Module):
+    """Distinguish trajectory embeddings from text embeddings."""
+
     def __init__(self, embed_dim):
         super().__init__()
         self.net = nn.Sequential(
