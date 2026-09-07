@@ -2,6 +2,13 @@
 # Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
 # Decision Transformer License: https://github.com/kzl/decision-transformer/blob/master/LICENSE.md
 
+"""Prompt-DT trajectory encoding and TENET text-to-policy components.
+
+The inherited transformer encodes prompted trajectories. TENET adds a frozen or
+fine-tunable language encoder, embedding-alignment options, and a hypernetwork
+that instantiates compact task-conditioned policies.
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,6 +33,8 @@ from vector_quantize_pytorch import FSQ
 import copy
 
 class TextEncoder(nn.Module):
+    """Encode task descriptions and project them into policy-embedding space."""
+
     def __init__(
         self,
         model_name,
@@ -50,11 +59,11 @@ class TextEncoder(nn.Module):
         self.num_projection_layers = num_projection_layers
         self.finetune_method = llm_finetune_method.lower()
 
-        # Tokenizer
+        # Tokenization uses EOS as padding because LLaMA has no pad token.
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Base LLM
+        # Load the pretrained causal language model before configuring updates.
         base_model = AutoModelForCausalLM.from_pretrained(model_name)
 
         if self.finetune_method == "lora":
@@ -66,32 +75,30 @@ class TextEncoder(nn.Module):
                 lora_dropout=lora_dropout
             )
             self.encoder = get_peft_model(base_model, peft_config)
-            # print("[LoRA] Using LoRA adapters.")
             self.encoder.print_trainable_parameters()
         elif self.finetune_method == "full":
             self.encoder = base_model
-            # print("[Full FT] Fine-tuning all LLM parameters.")
         elif self.finetune_method == "none":
             for param in base_model.parameters():
                 param.requires_grad = False
             self.encoder = base_model
-            # print("[Frozen] No LLM parameters will be updated.")
         else:
             raise ValueError(f"Invalid LLM fine-tuning method: {self.finetune_method}")
 
-        # Pooling layer
+        # Optional learned pooling modules operate over token features.
         if self.pooling_type == 'attention':
             self.attention_pool = nn.Linear(self.encoder.config.hidden_size, 1)
         elif self.pooling_type == 'transformer':
             encoder_layer = nn.TransformerEncoderLayer(d_model=self.encoder.config.hidden_size, nhead=transformer_nhead)
             self.transformer_pool = nn.TransformerEncoder(encoder_layer, num_layers=transformer_nlayer)
 
-        # Projection head
+        # Project pooled language features to the policy-conditioning size.
         self.projector = self._build_projection_head(self.encoder.config.hidden_size, hidden_size)
         
 
     def _build_projection_head(self, input_dim, output_dim):
-        # If dimensions match, return identity
+        """Construct the configured linear or multilayer projection head."""
+        # No learned projection is needed when the dimensions already match.
         if input_dim == output_dim:
             return nn.Identity()
 
@@ -109,6 +116,7 @@ class TextEncoder(nn.Module):
             raise ValueError(f"Invalid projection type: {self.projection_type}")
 
     def forward(self, text_batch, already_encoded=False):
+        """Pool and project raw text, or project cached LLM embeddings."""
         
         if not already_encoded:
             if isinstance(text_batch, str):
@@ -173,6 +181,7 @@ class TextEncoder(nn.Module):
 
 
 class PromptDecisionTransformer(nn.Module):
+    """Encode trajectories with the prompt-augmented Decision Transformer."""
 
     def __init__(
             self,
@@ -192,13 +201,9 @@ class PromptDecisionTransformer(nn.Module):
         self.hidden_size = hidden_size
         self.act_hidden_size = act_hidden_size
         self.normalize_embeddings = normalize_embeddings
-        # config = transformers.GPT2Config(vocab_size=1, n_embd=hidden_size, **kwargs)
-
-        # note: the only difference between this GPT2Model and the default Huggingface version
-        # is that the positional embeddings are removed (since we'll add those ourselves)
+        # This GPT-2 variant omits positional embeddings; explicit timestep embeddings
+        # supply temporal position information below.
         self.transformer = GPT2Model(config)
-        # change to parallelize mode for metaworld big model
-        # self.transformer.parallelize()
 
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
         self.embed_return = torch.nn.Linear(1, hidden_size)
@@ -212,46 +217,43 @@ class PromptDecisionTransformer(nn.Module):
 
         self.embed_ln = nn.LayerNorm(hidden_size)
 
-        # note: we don't predict states or returns for the paper
+        # State and return heads are inherited; policy learning uses action features.
         self.predict_state = torch.nn.Linear(hidden_size, self.state_dim)
-        # self.predict_action = nn.Sequential(
-        #     *([nn.Linear(hidden_size, self.act_dim)] + ([nn.Tanh()] if action_tanh else []))
-        # )
         self.predict_return = torch.nn.Linear(hidden_size, 1)
         
         if self.hidden_size != self.act_hidden_size:
             self.action_embedding = torch.nn.Linear(hidden_size, act_hidden_size)
 
     def forward(self, states, actions, rewards, returns_to_go, timesteps, attention_mask=None, prompt=None):
+        """Return per-step action features and a trajectory-level embedding."""
         batch_size, seq_length = states.shape[0], states.shape[1]
         if attention_mask is None:
-            # attention mask for GPT: 1 if can be attended to, 0 if not
+            # GPT attention uses one for valid tokens and zero for padding.
             attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
 
-        # embed each modality with a different head
+        # Embed returns, states, and actions with separate modality projections.
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
         returns_embeddings = self.embed_return(returns_to_go)
         time_embeddings = self.embed_timestep(timesteps)
 
-        # time embeddings are treated similar to positional embeddings
+        # Add the same timestep embedding to each modality at that step.
         state_embeddings = state_embeddings + time_embeddings
         action_embeddings = action_embeddings + time_embeddings
         returns_embeddings = returns_embeddings + time_embeddings
 
-        # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
-        # which works nice in an autoregressive sense since states predict actions
+        # Interleave tokens as (return, state, action) for autoregressive prediction.
         stacked_inputs = torch.stack(
             (returns_embeddings, state_embeddings, action_embeddings), dim=1
         ).permute(0, 2, 1, 3).reshape(batch_size, 3*seq_length, self.hidden_size)
         stacked_inputs = self.embed_ln(stacked_inputs)
 
-        # to make the attention mask fit the stacked inputs, have to stack it as well
+        # Repeat each timestep mask for its return, state, and action tokens.
         stacked_attention_mask = torch.stack(
             (attention_mask, attention_mask, attention_mask), dim=1
         ).permute(0, 2, 1).reshape(batch_size, 3*seq_length)
 
-        # process prompt the same as d-t
+        # Encode prompt trajectories with separate modality embeddings.
         if prompt is not None:
             prompt_states, prompt_actions, prompt_rewards, prompt_dones, prompt_returns_to_go, prompt_timesteps, prompt_attention_mask = prompt
             prompt_seq_length = prompt_states.shape[1]
@@ -276,7 +278,7 @@ class PromptDecisionTransformer(nn.Module):
                 (prompt_attention_mask, prompt_attention_mask, prompt_attention_mask), dim=1
             ).permute(0, 2, 1).reshape(prompt_states.shape[0], 3 * prompt_seq_length)
 
-            # stacked_inputs add prompted sequence
+            # Prepend either one shared prompt or one prompt per batch item.
             if prompt_stacked_inputs.shape[1] == 3 * seq_length: # if only smaple one prompt
                 prompt_stacked_inputs = prompt_stacked_inputs.reshape(1, -1, self.hidden_size)
                 prompt_stacked_attention_mask = prompt_stacked_attention_mask.reshape(1, -1)
@@ -285,7 +287,7 @@ class PromptDecisionTransformer(nn.Module):
             else: # if sample one prompt for each traj in batch
                 stacked_inputs = torch.cat((prompt_stacked_inputs, stacked_inputs), dim=1)
                 stacked_attention_mask = torch.cat((prompt_stacked_attention_mask, stacked_attention_mask), dim=1)
-        # we feed in the input embeddings (not word indices as in NLP) to the model
+        # Pass continuous trajectory embeddings rather than token IDs.
         transformer_outputs = self.transformer(
             inputs_embeds=stacked_inputs,
             attention_mask=stacked_attention_mask,
@@ -299,11 +301,9 @@ class PromptDecisionTransformer(nn.Module):
         else:
             x = x.reshape(batch_size, -1, 3, self.hidden_size).permute(0, 2, 1, 3)
 
-        # note here all the prompt are pre-append to x, but when return only return the last [:, -seq_length:, :] corresponding to batch data
-        # get predictions
+        # Prompts occupy the prefix; predictions retain only the current trajectory.
         return_preds = self.predict_return(x[:,2])[:, -seq_length:, :]  # predict next return given state and action
         state_preds = self.predict_state(x[:,2])[:, -seq_length:, :]    # predict next state given state and action
-        # action_preds = self.predict_action(x[:,1])[:, -seq_length:, :]  # predict next action given state
         action_trajectory_embeddings = x[:, 1,-seq_length:, :]
         trajectory_embedding =  x[:,2,-1,:]
         
@@ -323,6 +323,7 @@ class PromptDecisionTransformer(nn.Module):
 
 
 class DTPolicy(nn.Module):
+    """Map trajectory embeddings directly to bounded actions."""
 
     def __init__(self, state_dim, act_dim, hidden_size, action_tanh=True):
         super().__init__()
@@ -337,6 +338,8 @@ class DTPolicy(nn.Module):
         return self.policy(embedding)
     
 class FeatureExtractor(nn.Module):
+    """Project raw states into the generated policy's feature space."""
+
     def __init__(self, state_dim, hidden_size):
         super().__init__()
         self.net = nn.Sequential(
@@ -346,7 +349,7 @@ class FeatureExtractor(nn.Module):
         self.hidden_size = hidden_size
 
     def forward(self, x):
-        # Accept (B,S,D) or (B,D)
+        # Accept batched state sequences or individual batched states.
         if x.dim() == 3:
             B, S, D = x.shape
             x = x.reshape(B * S, D)
@@ -356,6 +359,7 @@ class FeatureExtractor(nn.Module):
             return self.net(x)  # (B, H)
 
 def calculate_gain(name: str):
+    """Return a supported PyTorch initialization gain."""
     safe = name.lower()
     if safe not in ['linear','conv1d','conv2d','conv3d','sigmoid','tanh','relu','leaky_relu','selu','gelu']:
         safe = 'tanh'
@@ -364,6 +368,8 @@ def calculate_gain(name: str):
 
 
 class PolicySpec:
+    """Describe the dimensions of every compact-policy layer."""
+
     def __init__(self, state_feat_dim: int, act_dim: int, hidden_layers: List[int]):
         self.state_feat_dim = state_feat_dim
         self.act_dim = act_dim
@@ -371,6 +377,7 @@ class PolicySpec:
 
     @property
     def layer_dims(self) -> List[Tuple[int, int]]:
+        """Return input/output dimensions for all generated layers."""
         dims = []
         in_dim = self.state_feat_dim
         for h in self.hidden_layers:
@@ -383,27 +390,27 @@ LayerParam = Dict[str, torch.Tensor]
 ParamsType = List[LayerParam]
 
 class HyperPolicy(nn.Module):
-    """
-    params per layer:
-      static: {'W': (in,out), 'b': (out,)}
-      time-varying: {'W': (S,in,out), 'b': (S,out)}
-    Actor hidden: ReLU; final: tanh (MATCH OLD).
+    """Execute a compact policy from hypernetwork-generated parameters.
+
+    Parameters may be static per task or vary across sequence steps. Hidden
+    layers use ReLU and the final action layer uses tanh.
     """
     def __init__(self, spec: PolicySpec, state_feature_extractor: nn.Module,
                  params: ParamsType):
         super().__init__()
         self.spec = spec
         self.state_feature_extractor = state_feature_extractor
-        self.act = nn.ReLU()   # MATCH OLD
-        self.final_act = nn.Tanh()  # MATCH OLD
+        self.act = nn.ReLU()   # Hidden activation used by the released model.
+        self.final_act = nn.Tanh()  # Bound generated-policy actions.
         self.params = params
 
     @torch.no_grad()
     def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Execute the instantiated policy on one state or state sequence."""
         x = self.state_feature_extractor(state)  # (B,S,H) or (B,H)
 
         if x.dim() == 2:
-            # (B,H) requires static params
+            # Individual states require a static parameter set.
             for i, layer in enumerate(self.params):
                 W, b = layer['W'], layer['b']
                 if W.dim() != 2:
@@ -413,7 +420,7 @@ class HyperPolicy(nn.Module):
                     x = self.act(x)
             return self.final_act(x)
 
-        # (B,S,H)
+        # Apply static or time-varying parameters to a state sequence.
         for i, layer in enumerate(self.params):
             W, b = layer['W'], layer['b']
             if W.dim() == 2:
@@ -427,25 +434,24 @@ class HyperPolicy(nn.Module):
         return self.final_act(x)
 
 class HyperNetwork(nn.Module):
-    """
-    Decoupled version aligned to OLD behavior.
-    - Hyper trunk activation: tanh
-    - Actor hidden: ReLU
-    - Actor final: tanh
+    """Generate all weights and biases of a compact task policy.
+
+    The conditioning trunk uses tanh; generated policy hidden layers use ReLU;
+    and generated actions are bounded with tanh.
     """
     def __init__(self, state_dim, act_dim, hidden_size,
                  hypernet_layers=[128, 128],
                  hidden_layers=[128, 128]):
         super().__init__()
 
-        self.hyper_act = nn.Tanh()  # MATCH OLD
-        self.actor_hidden_act = nn.ReLU()  # MATCH OLD
-        self.actor_final_act = nn.Tanh()   # MATCH OLD
+        self.hyper_act = nn.Tanh()  # Hypernetwork trunk activation.
+        self.actor_hidden_act = nn.ReLU()  # Compact-policy hidden activation.
+        self.actor_final_act = nn.Tanh()   # Bound compact-policy actions.
         self.gain = calculate_gain('tanh')
 
         self.state_feature_extractor = FeatureExtractor(state_dim, hidden_size)
 
-        # Hyper trunk (operates on last dim; preserves leading dims)
+        # The hypernetwork trunk preserves all leading batch/sequence dimensions.
         self.hyper_layers = nn.ModuleList()
         cur_dim = hidden_size
         for next_sz in hypernet_layers:
@@ -462,13 +468,13 @@ class HyperNetwork(nn.Module):
             hidden_layers=hidden_layers,
         )
 
-        # Heads to map hyper features -> flattened weights/biases
+        # Each compact-policy layer receives its own weight and bias heads.
         self.hyper_W_heads = nn.ModuleList()
         self.hyper_b_heads = nn.ModuleList()
         for (in_dim, out_dim) in self.spec.layer_dims:
             w_sz = in_dim * out_dim
             b_sz = out_dim
-            # last layer gain=1.0, else tanh gain
+            # Hidden heads use tanh gain; the action head uses unit gain.
             w_gain = 1.0 if (out_dim == self.spec.act_dim) else self.gain
             W = nn.Linear(self.final_hyper_hidden_sz, w_sz)
             b = nn.Linear(self.final_hyper_hidden_sz, b_sz)
@@ -478,11 +484,13 @@ class HyperNetwork(nn.Module):
             self.hyper_b_heads.append(b)
 
     def _init_normc_(self, weight, gain=1.0):
+        """Apply the column-normalized initialization used in the experiments."""
         nn.init.normal_(weight, mean=0, std=1)
         weight.data /= torch.sqrt(weight.pow(2).sum(0, keepdim=True) + 1e-8)
         weight.data *= gain
 
     def _hyper_features(self, embedding: torch.Tensor) -> torch.Tensor:
+        """Transform conditioning embeddings through the hypernetwork trunk."""
         z = embedding  # (B,E) or (B,S,E)
         for layer in self.hyper_layers:
             z = self.hyper_act(layer(z))
@@ -501,13 +509,13 @@ class HyperNetwork(nn.Module):
         def build(z_slice: torch.Tensor) -> ParamsType:
             params: ParamsType = []
             if z_slice.dim() == 1:
-                # static
+                # One static parameter set.
                 for (in_dim, out_dim), W_head, b_head in zip(self.spec.layer_dims, self.hyper_W_heads, self.hyper_b_heads):
                     W = W_head(z_slice).view(in_dim, out_dim)
                     b = b_head(z_slice).view(out_dim)
                     params.append({'W': W, 'b': b})
             else:
-                # time-varying
+                # One parameter set per sequence step.
                 S = z_slice.shape[0]
                 for (in_dim, out_dim), W_head, b_head in zip(self.spec.layer_dims, self.hyper_W_heads, self.hyper_b_heads):
                     W_flat = W_head(z_slice)    # (S, in*out)
@@ -523,13 +531,15 @@ class HyperNetwork(nn.Module):
 
     @torch.no_grad()
     def build_policy(self, embedding: torch.Tensor) -> Union[nn.Module, List[nn.Module]]:
+        """Instantiate inference policies from generated parameters."""
         params = self.generate_params(embedding)
         if isinstance(params, list) and params and isinstance(params[0], list):
             return [HyperPolicy(self.spec, self.state_feature_extractor, p) for p in params]
         return HyperPolicy(self.spec, self.state_feature_extractor, params)
 
-    # Training-time joint forward (aligned to OLD behavior)
+    # Joint generation/application path used during optimization.
     def forward(self, embedding: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        """Generate parameters and apply them jointly during training."""
         z = self._hyper_features(embedding)  # (B,E) or (B,S,E)
         x = self.state_feature_extractor(state)  # (B,S,H) or (B,H)
 
@@ -538,7 +548,7 @@ class HyperNetwork(nn.Module):
         if x.dim() == 3:
             B, S, H = x.shape
             if z.dim() == 2:
-                # static per batch
+                # One generated parameter set per batch item.
                 for i, ((in_dim, out_dim), W_head, b_head) in enumerate(zip(layer_dims, self.hyper_W_heads, self.hyper_b_heads)):
                     W = W_head(z).view(B, in_dim, out_dim)
                     b = b_head(z).view(B, 1, out_dim)
@@ -547,7 +557,7 @@ class HyperNetwork(nn.Module):
                         x = self.actor_hidden_act(x)
                 return self.actor_final_act(x)
             else:
-                # time-varying per step
+                # One generated parameter set per sequence step.
                 for i, ((in_dim, out_dim), W_head, b_head) in enumerate(zip(layer_dims, self.hyper_W_heads, self.hyper_b_heads)):
                     W = W_head(z).view(B, S, in_dim, out_dim)
                     b = b_head(z).view(B, S, out_dim)
@@ -556,7 +566,7 @@ class HyperNetwork(nn.Module):
                         x = self.actor_hidden_act(x)
                 return self.actor_final_act(x)
         else:
-            # (B,H) states require static z
+            # Individual states require one static conditioning embedding.
             if z.dim() != 2:
                 raise ValueError("For (B,H) states, embedding must be (B,E).")
             for i, ((in_dim, out_dim), W_head, b_head) in enumerate(zip(layer_dims, self.hyper_W_heads, self.hyper_b_heads)):
@@ -570,6 +580,7 @@ class HyperNetwork(nn.Module):
 
 
 class Predictor(nn.Module):
+    """Combine trajectory and text encoders with shared or separate policies."""
 
     def __init__(
             self,
@@ -631,6 +642,7 @@ class Predictor(nn.Module):
 
 
     def forward(self, states, actions, rewards, returns_to_go, timesteps, attention_mask=None, prompt=None, text=None):
+        """Compute trajectory/text actions and embeddings for enabled losses."""
         
         state_preds, action_trajectory_embeddings, return_preds, trajectory_embedding = self.trajectory_encoder(states, actions, rewards, returns_to_go, timesteps, attention_mask, prompt)
         
@@ -673,7 +685,8 @@ class Predictor(nn.Module):
         return state_preds, action_preds, return_preds, action_trajectory_embeddings, trajectory_embedding, text_embedding, action_preds_llm, goal_pred_llm
 
     def get_action(self, states, actions, rewards, returns_to_go, timesteps, prompt):
-        # we don't care about the past rewards in this model
+        """Predict the next action from a padded trajectory context."""
+        # Rewards are retained for the inherited interface but are not encoded.
 
         states = states.reshape(1, -1, self.state_dim)
         actions = actions.reshape(1, -1, self.act_dim)
@@ -686,7 +699,7 @@ class Predictor(nn.Module):
             returns_to_go = returns_to_go[:,-self.max_length:]
             timesteps = timesteps[:,-self.max_length:]
 
-            # pad all tokens to sequence length
+            # Left-pad each modality to the configured context length.
             attention_mask = torch.cat([torch.zeros(self.max_length-states.shape[1]), torch.ones(states.shape[1])])
             attention_mask = attention_mask.to(dtype=torch.long, device=states.device).reshape(1, -1)
             states = torch.cat(
@@ -707,7 +720,7 @@ class Predictor(nn.Module):
             attention_mask = None
             
 
-        # Note: prompt within kwargs
+        # The prompt is prepended inside the trajectory encoder.
         _, action_embeddings, _,_  = self.trajectory_encoder(
             states, actions, None, returns_to_go, timesteps, attention_mask=attention_mask, prompt=prompt)
         
@@ -719,6 +732,3 @@ class Predictor(nn.Module):
             
 
         return action_preds[0,-1]
-
-    
-    
