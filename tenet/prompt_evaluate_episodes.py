@@ -2,6 +2,13 @@
 # Prompt-DT builds on Decision Transformer: https://github.com/kzl/decision-transformer/
 # Decision Transformer License: https://github.com/kzl/decision-transformer/blob/master/LICENSE.md
 
+"""Episode-evaluation helpers for trajectory- and text-conditioned policies.
+
+The trajectory-conditioned evaluators maintain the history consumed by
+Decision Transformer/Prompt-DT. The text-conditioned evaluator executes the
+compact policy instantiated by TENET directly from a task description.
+"""
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -24,6 +31,7 @@ def prompt_evaluate_episode(
         no_rtg=False,
         no_state_normalize=False,
 ):
+    """Evaluate a trajectory-conditioned policy with the legacy Gym API."""
 
     model.eval()
     model.to(device=device)
@@ -33,8 +41,8 @@ def prompt_evaluate_episode(
 
     state = env.reset()
 
-    # we keep all the histories on the device
-    # note that the latest action and reward will be "padding"
+    # Keep the complete rollout history on the target device. At every step,
+    # the final action and reward entries are placeholders filled after acting.
     states = torch.from_numpy(state).reshape(1, state_dim).to(device=device, dtype=torch.float32)
     actions = torch.zeros((0, act_dim), device=device, dtype=torch.float32)
     rewards = torch.zeros(0, device=device, dtype=torch.float32)
@@ -44,7 +52,7 @@ def prompt_evaluate_episode(
     episode_return, episode_length = 0, 0
     for t in range(max_ep_len):
 
-        # add padding
+        # Append placeholders so the model predicts the current action.
         actions = torch.cat([actions, torch.zeros((1, act_dim), device=device)], dim=0)
         rewards = torch.cat([rewards, torch.zeros(1, device=device)])
         if no_state_normalize:
@@ -101,6 +109,7 @@ def prompt_evaluate_episode_rtg(
         no_rtg=False,
         no_state_normalize=False
     ):
+    """Evaluate Prompt-DT while updating return-to-go after each action."""
 
     model.eval()
     model.to(device=device)
@@ -112,8 +121,8 @@ def prompt_evaluate_episode_rtg(
     if mode == 'noise':
         state = state + np.random.normal(0, 0.1, size=state.shape)
 
-    # we keep all the histories on the device
-    # note that the latest action and reward will be "padding"
+    # Keep the complete rollout history on the target device. At every step,
+    # the final action and reward entries are placeholders filled after acting.
     states = torch.from_numpy(state).reshape(1, state_dim).to(device=device, dtype=torch.float32)
     actions = torch.zeros((0, act_dim), device=device, dtype=torch.float32)
     rewards = torch.zeros(0, device=device, dtype=torch.float32)
@@ -127,8 +136,7 @@ def prompt_evaluate_episode_rtg(
     episode_return, episode_length = 0, 0
     success = False
     for t in range(max_ep_len):
-        # print('evaluate/t', t)
-        # add padding
+        # Append placeholders so the model predicts the current action.
         actions = torch.cat([actions, torch.zeros((1, act_dim), device=device)], dim=0)
         rewards = torch.cat([rewards, torch.zeros(1, device=device)])
         if no_state_normalize:
@@ -162,6 +170,8 @@ def prompt_evaluate_episode_rtg(
         if no_r:
             rewards[-1] = 0.0
 
+        # Standard evaluation subtracts observed reward from the desired
+        # return; delayed mode holds the desired return fixed.
         if mode != 'delayed':
             pred_return = target_return[0,-1] - (reward/scale)
         else:
@@ -199,6 +209,7 @@ def prompt_evaluate_episode_llm(
         text=None,
         no_state_normalize=False
     ):
+    """Evaluate the compact policy instantiated from a text embedding."""
 
     
     state_mean = torch.from_numpy(state_mean).to(device=device)
@@ -233,75 +244,3 @@ def prompt_evaluate_episode_llm(
         if done:
             break
     return episode_return, success, infos
-
-
-
-# def prompt_evaluate_episode_llm(
-#         env,
-#         policy,
-#         max_ep_len=1000,
-#         state_mean=0.,
-#         state_std=1.,
-#         device='cuda',
-#         text=None,
-#         no_state_normalize=False,
-#         # --- NEW ---
-#         measure_actions_per_sec: bool = True,
-#         measure_at_step: int = 20,
-#         warmup_calls: int = 50,
-#         measure_calls: int = 500,
-#     ):
-
-#     import time
-#     import torch
-
-#     state_mean = torch.from_numpy(state_mean).to(device=device)
-#     state_std = torch.from_numpy(state_std).to(device=device)
-
-#     state, _ = env.reset()
-
-#     episode_return, episode_length = 0, 0
-#     success = False
-#     use_cuda = next(policy.parameters()).is_cuda if hasattr(policy, "parameters") else False
-
-#     for t in range(max_ep_len):
-#         state_tensor = torch.from_numpy(state).to(device=device, dtype=torch.float32).unsqueeze(0)
-#         s_norm = (state_tensor - state_mean) / state_std
-
-#         # ---- BENCHMARK (only prints) ----
-#         if measure_actions_per_sec and t == measure_at_step:
-#             with torch.inference_mode():
-#                 if use_cuda: torch.cuda.synchronize()
-#                 for _ in range(warmup_calls):
-#                     _ = policy(s_norm)
-#                 if use_cuda: torch.cuda.synchronize()
-
-#                 t0 = time.perf_counter()
-#                 for _ in range(measure_calls):
-#                     _ = policy(s_norm)
-#                 if use_cuda: torch.cuda.synchronize()
-#                 dt = time.perf_counter() - t0
-
-#             actions_per_sec = measure_calls / dt if dt > 0 else float("inf")
-#             print(f"[Benchmark @ step {t}] Actions/sec: {actions_per_sec:.1f}")
-#         # --------------------------------
-
-#         with torch.inference_mode():
-#             action = policy(s_norm)
-
-#         action = action.detach().cpu().numpy()[0]
-
-#         state, reward, terminate, truncate, infos = env.step(action)
-#         done = terminate or truncate
-
-#         episode_return += reward
-#         episode_length += 1
-#         infos['episode_length'] = episode_length
-
-#         if infos.get("success", 0.0) > 0:
-#             success = True
-#             break
-#         if done:
-#             break
-
-#     return episode_return, success, infos
