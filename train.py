@@ -32,9 +32,9 @@ BENCHMARKS = {
 # unchanged from the original launcher.
 METHODS = {
     "dt": {"no_prompt": True, "log_to_wandb": True, "max_iters": 5000},
-    "prompt_dt": {"log_to_wandb": False, "max_iters": 5000},
+    "prompt_dt": {"log_to_wandb": True, "max_iters": 5000},
     "tenet": {
-        "log_to_wandb": False,
+        "log_to_wandb": True,
         "hyper_network": True,
         "hn_embed_dim": 256,
         "consistency_regularizer": True,
@@ -60,7 +60,7 @@ METHODS = {
         "max_iters": 5000,
     },
     "tenet_mse": {
-        "log_to_wandb": False,
+        "log_to_wandb": True,
         "hyper_network": True,
         "hn_embed_dim": 256,
         "consistency_regularizer": True,
