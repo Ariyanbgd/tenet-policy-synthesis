@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "TeNet: Text-to-Network for Compact Policy Synthesis"
+type: software
+authors:
+  - family-names: Bighashdel
+    given-names: Ariyan
+    affiliation: Utrecht University
+    email: a.bighashdel@uu.nl
+  - family-names: Luck
+    given-names: Kevin Sebastian
+    affiliation: Vrije Universiteit Amsterdam
+    email: k.s.luck@vu.nl
+abstract: >-
+  TeNet uses a pretrained language model and a hypernetwork to instantiate
+  compact, task-specific robot policies directly from natural-language task
+  descriptions. This repository contains the Meta-World experiments released
+  with the IJCAI-ECAI 2026 paper.
+keywords:
+  - language-conditioned control
+  - hypernetworks
+  - robot learning
+  - offline reinforcement learning
+  - Meta-World
+url: "https://sites.google.com/view/tenet-policy-synthesis"
+preferred-citation:
+  type: conference-paper
+  title: "TeNet: Text-to-Network for Compact Policy Synthesis"
+  authors:
+    - family-names: Bighashdel
+      given-names: Ariyan
+    - family-names: Luck
+      given-names: Kevin Sebastian
+  collection-title: >-
+    Proceedings of the Thirty-Fifth International Joint Conference on
+    Artificial Intelligence and the Twenty-Ninth European Conference on
+    Artificial Intelligence
+  year: 2026
