@@ -16,5 +16,4 @@ config/
 
 # Generated plots
 /*.pdf
-!/IJCAI__ECAI_26_TENET_Camera_Ready_Version.pdf
 
