@@ -28,8 +28,6 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import get_peft_model, LoraConfig, TaskType
 
-from vector_quantize_pytorch import FSQ
-
 import copy
 
 class TextEncoder(nn.Module):
@@ -632,25 +630,12 @@ class Predictor(nn.Module):
                     nn.Linear(256, 3),
                 )
                 
-        if self.args.quantized_embed:
-            quant_level = self.args.quant_level
-            quant_dim = self.args.hn_embed_dim
-            self.quantizer = FSQ(
-                levels = [quant_level]*quant_dim, return_indices=False
-            )
-            
-
 
     def forward(self, states, actions, rewards, returns_to_go, timesteps, attention_mask=None, prompt=None, text=None):
         """Compute trajectory/text actions and embeddings for enabled losses."""
         
         state_preds, action_trajectory_embeddings, return_preds, trajectory_embedding = self.trajectory_encoder(states, actions, rewards, returns_to_go, timesteps, attention_mask, prompt)
         
-        if self.args.quantized_embed:
-            action_trajectory_embeddings = self.quantizer(action_trajectory_embeddings)[0]
-            if self.args.quantized_embed_for_loss:
-                trajectory_embedding = self.quantizer(trajectory_embedding.unsqueeze(1))[0].squeeze(1)
-            
         action_preds =  self.policy(action_trajectory_embeddings,states)
         goal_pred_llm = None
         if text is not None:
@@ -664,10 +649,6 @@ class Predictor(nn.Module):
             action_text_embeddings = text_embedding.unsqueeze(dim=1)
             length = action_trajectory_embeddings.shape[1]
             action_text_embeddings = action_text_embeddings.repeat(1,length,1)
-            if self.args.quantized_embed:
-                action_text_embeddings = self.quantizer(action_text_embeddings)[0]
-                if self.args.quantized_embed_for_loss:
-                    text_embedding = self.quantizer(text_embedding)[0].squeeze(1)
             if self.args.dual_policy:
                 action_preds_llm = self.llm_policy(action_text_embeddings,states)
             else:
@@ -724,9 +705,6 @@ class Predictor(nn.Module):
         _, action_embeddings, _,_  = self.trajectory_encoder(
             states, actions, None, returns_to_go, timesteps, attention_mask=attention_mask, prompt=prompt)
         
-        
-        if self.args.quantized_embed:
-            action_embeddings = self.quantizer(action_embeddings)[0]
         
         action_preds =  self.policy(action_embeddings,states)
             

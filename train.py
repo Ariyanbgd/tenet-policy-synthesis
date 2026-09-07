@@ -155,9 +155,6 @@ BASE_CONFIG = {
     "policy_hidden_layers": [128, 128],
     "consistency_regularizer": False,
     "cr_coeff": 0.0001,
-    "quantized_embed": False,
-    "quantized_embed_for_loss": False,
-    "quant_level": 21,
     # Decision Transformer architecture and optimization
     "mode": "normal",
     "K": 20,

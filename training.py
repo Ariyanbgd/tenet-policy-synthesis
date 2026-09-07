@@ -517,10 +517,6 @@ if __name__ == '__main__':
     parser.add_argument('--policy-hidden-layers', type=lambda s: [int(x) for x in s.split(',')],default=[128, 128])
     parser.add_argument('--consistency-regularizer', action='store_true', default=False) # False
     parser.add_argument('--cr-coeff', type=float, default=0.0001)
-    parser.add_argument('--quantized_embed', action='store_true', default=False)
-    parser.add_argument('--quantized_embed_for_loss', action='store_true', default=False)
-    parser.add_argument('--quant-level', type=int, default=21)
-
     parser.add_argument('--mode', type=str, default='normal')
     parser.add_argument('--K', type=int, default=20)
     parser.add_argument('--pct_traj', type=float, default=1.)

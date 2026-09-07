@@ -20,7 +20,5 @@ dependencies:
       - accelerate==1.9.0
       - peft==0.13.2
       - safetensors==0.5.3
-      - einops==0.8.1
-      - einx==0.3.0
       - tqdm==4.67.1
       - wandb==0.19.9

@@ -52,7 +52,6 @@ training.py                 Data loading, model construction, and training loop
 generate_expert_data.py     Scripted-expert dataset generation
 tenet/                      Models, trainers, evaluation, and data utilities
 metaworld/                  Meta-World environments and scripted policies
-vector_quantize_pytorch/    Optional quantization components
 config/                     Generated benchmark metadata (not tracked)
 data/                       Generated expert trajectories (not tracked)
 results/                    Run outputs and checkpoints (not tracked)
@@ -83,7 +82,6 @@ wandb==0.19.9
 numpy==2.0.2
 gymnasium==1.1.1
 mujoco==3.3.4
-einops==0.8.1
 scipy==1.13.1
 ```
 
@@ -222,9 +220,9 @@ model, and a saved text encoder.
 
 This implementation was developed from the Prompt-DT codebase and retains
 components derived from Decision Transformer. It also includes Meta-World,
-Hugging Face GPT-2-derived trajectory-model code, and optional components from
-`vector-quantize-pytorch`. Please consult the upstream projects and the source
-headers for their respective copyright and license terms.
+Hugging Face GPT-2-derived trajectory-model code. Please consult the upstream
+projects and the source headers for their respective copyright and license
+terms.
 
 Before redistributing a modified version of this repository, preserve all
 applicable upstream notices. A repository-level license and consolidated

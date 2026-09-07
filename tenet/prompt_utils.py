@@ -755,8 +755,6 @@ def eval_episodes_llm(info, variant, env, env_name):
             text_embedding = model.text_encoder(random.choice(text))
             
 
-        if model.args.quantized_embed:
-            text_embedding = model.quantizer(text_embedding)[0]
         if model.args.dual_policy:
             policy = model.llm_policy.build_policy(text_embedding)
         else:
